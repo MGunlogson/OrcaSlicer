@@ -3031,6 +3031,8 @@ void GLCanvas3D::load_shells(const Print& print, bool force_previewing)
     {
         m_gcode_viewer.load_shells(print, m_initialized, force_previewing);
         m_gcode_viewer.update_shells_color_by_extruder(m_config);
+        // Magma: Load interior shell meshes for preview visualization
+        m_gcode_viewer.load_magma_shells(print);
     }
 }
 
@@ -3458,6 +3460,17 @@ void GLCanvas3D::on_char(wxKeyEvent& evt)
         //    }
         //    break;
         //}
+        case 'J':
+        case 'j': {
+            // Magma: 'J' cycles through interior shell stages in Preview mode
+            // cycle_magma_shell_stage() rebuilds from cache - no Print access needed
+            if (dynamic_cast<Preview*>(m_canvas->GetParent()) != nullptr) {
+                m_gcode_viewer.cycle_magma_shell_stage();
+                m_dirty = true;
+                request_extra_frame();
+            }
+            break;
+        }
         case 'I':
         case 'i': { _update_camera_zoom(1.0); break; }
         //case 'K':

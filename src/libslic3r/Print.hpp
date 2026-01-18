@@ -4,6 +4,7 @@
 #include "PrintBase.hpp"
 #include "Fill/FillAdaptive.hpp"
 #include "Fill/FillLightning.hpp"
+#include "SLA/Hollowing.hpp"
 
 #include "BoundingBox.hpp"
 #include "ExtrusionEntityCollection.hpp"
@@ -468,6 +469,26 @@ public:
     size_t get_id() const { return m_id; }
     void set_id(size_t id) { m_id = id; }
 
+    // Magma: Interior shell at each processing stage for debug visualization
+    struct MagmaInteriorStages {
+        indexed_triangle_set initial;   // After generate_interior (raw hollowed shell)
+        indexed_triangle_set filtered;  // After filter_thin_interior (thin sections removed)
+        indexed_triangle_set smoothed;  // After smooth_interior (final)
+    };
+    // Magma: Access to interior shell mesh for preview visualization
+    bool has_magma_interior() const { return m_magma_interior && !sla::get_mesh(*m_magma_interior).empty(); }
+    const indexed_triangle_set& magma_interior_mesh() const { return sla::get_mesh(*m_magma_interior); }
+    const MagmaInteriorStages& magma_stages() const { return m_magma_stages; }
+    // Check if a specific stage has a valid mesh (0=initial, 1=filtered, 2=smoothed)
+    bool has_magma_stage(int stage) const {
+        switch (stage) {
+            case 0: return !m_magma_stages.initial.empty();
+            case 1: return !m_magma_stages.filtered.empty();
+            case 2: return !m_magma_stages.smoothed.empty();
+            default: return false;
+        }
+    }
+
   private:
     // to be called from Print only.
     friend class Print;
@@ -512,6 +533,8 @@ private:
     std::vector<std::set<int>> detect_extruder_geometric_unprintables() const;
 
     void slice_volumes();
+    // Magma: Compute 3D shell and slice it for zone boundaries
+    void compute_magma_shell();
     //BBS
     ExPolygons _shrink_contour_holes(double contour_delta, double hole_delta, const ExPolygons& polys) const;
     // BBS
@@ -564,6 +587,10 @@ private:
 
     std::pair<FillAdaptive::OctreePtr, FillAdaptive::OctreePtr> m_adaptive_fill_octrees;
     FillLightning::GeneratorPtr m_lightning_generator;
+
+    // Magma: 3D interior shell for zone boundary computation
+    sla::InteriorPtr m_magma_interior;
+    MagmaInteriorStages m_magma_stages;
 
     std::vector < VolumeSlices >            firstLayerObjSliceByVolume;
     std::vector<groupedVolumeSlices>        firstLayerObjSliceByGroups;

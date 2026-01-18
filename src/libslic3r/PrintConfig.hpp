@@ -75,7 +75,16 @@ enum InfillPattern : int {
     ipCrossHatch, ipTpmsD, ipTpmsFK, ipGyroid,
     ipConcentric, ipHilbertCurve, ipArchimedeanChords, ipOctagramSpiral,
     ipSupportBase, ipConcentricInternal,
+    // Magma infill patterns for vertical reinforcement
+    ipMagmaHex, ipMagmaTriangle,
     ipCount,
+};
+
+// Magma pattern selection (separate enum for dropdown UI)
+enum class MagmaPattern : int {
+    Triangle,
+    Hex,
+    Count,
 };
 
 enum class IroningType {
@@ -1186,6 +1195,23 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloatOrPercent,       scarf_joint_speed))
     ((ConfigOptionFloat,                scarf_joint_flow_ratio))
     ((ConfigOptionPercent,              scarf_overhang_threshold))
+
+    // Magma infill configuration
+    ((ConfigOptionBool,                 magma_inner_shell_enabled))
+    ((ConfigOptionEnum<MagmaPattern>,   magma_pattern))
+    ((ConfigOptionFloat,                magma_outer_infill_width))
+    ((ConfigOptionInt,                  magma_inner_shell_line_count))
+    ((ConfigOptionFloatOrPercent,       magma_inner_shell_line_width))
+    ((ConfigOptionFloat,                magma_min_yolk_width))
+    ((ConfigOptionInt,                  magma_shell_solid_layers))
+    ((ConfigOptionFloat,                magma_shell_solid_thickness))
+    // Magma speed configuration (0 = use default speed)
+    ((ConfigOptionFloat,                magma_infill_speed))
+    ((ConfigOptionFloat,                magma_shell_speed))
+    ((ConfigOptionFloat,                magma_floor_speed))
+    ((ConfigOptionFloat,                magma_ceiling_speed))
+    // Magma debug options
+    ((ConfigOptionBool,                 magma_debug_export_shells))
 )
 
 PRINT_CONFIG_CLASS_DEFINE(

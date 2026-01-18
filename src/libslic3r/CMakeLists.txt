@@ -159,6 +159,8 @@ set(lisbslic3r_sources
     Fill/FillLightning.hpp
     Fill/FillLine.cpp
     Fill/FillLine.hpp
+    Fill/FillMagma.cpp
+    Fill/FillMagma.hpp
     Fill/FillPlanePath.cpp
     Fill/FillPlanePath.hpp
     Fill/FillRectilinear.cpp
@@ -283,6 +285,8 @@ set(lisbslic3r_sources
     Line.hpp
     LocalesUtils.cpp
     LocalesUtils.hpp
+    Magma/MagmaInterior.cpp
+    Magma/MagmaInterior.hpp
     MarchingSquares.hpp
     Measure.cpp
     Measure.hpp
@@ -377,6 +381,7 @@ set(lisbslic3r_sources
     SLA/Concurrency.hpp
     SLA/Hollowing.cpp
     SLA/Hollowing.hpp
+    SLA/Interior.hpp
     SLA/IndexedMesh.cpp
     SLA/IndexedMesh.hpp
     SLA/JobController.hpp

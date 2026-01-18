@@ -147,6 +147,14 @@ enum class EGCodeExtrusionRole : uint8_t
       Brim,
       SupportTransition,
       Mixed,
+      // Magma solid infill for vertical reinforcement
+      MagmaInfill,
+      // Magma inner shell walls (perimeters between outer and inner zones)
+      MagmaShell,
+      // Magma floor (bottom of shell zone)
+      MagmaFloor,
+      // Magma ceiling (top of shell zone, bridges over yolk)
+      MagmaCeiling,
     COUNT
 };
 

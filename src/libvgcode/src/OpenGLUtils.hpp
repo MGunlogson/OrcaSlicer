@@ -15,9 +15,10 @@
 #include <string>
 
 namespace libvgcode {
-#ifndef NDEBUG
-#define HAS_GLSAFE
-#endif // NDEBUG
+// Disabled GL assertions for Docker debugging
+// #ifndef NDEBUG
+// #define HAS_GLSAFE
+// #endif // NDEBUG
 
 #ifdef HAS_GLSAFE
 extern void glAssertRecentCallImpl(const char* file_name, unsigned int line, const char* function_name);

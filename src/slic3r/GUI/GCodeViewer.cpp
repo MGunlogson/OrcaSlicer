@@ -286,6 +286,11 @@ static std::string to_string(libvgcode::EGCodeExtrusionRole role)
     case libvgcode::EGCodeExtrusionRole::Brim:                     { return _u8L("Brim"); }
     case libvgcode::EGCodeExtrusionRole::SupportTransition:        { return _u8L("Support transition"); }
     case libvgcode::EGCodeExtrusionRole::Mixed:                    { return _u8L("Mixed"); }
+    // Magma
+    case libvgcode::EGCodeExtrusionRole::MagmaInfill:              { return _u8L("Magma infill"); }
+    case libvgcode::EGCodeExtrusionRole::MagmaShell:               { return _u8L("Magma shell"); }
+    case libvgcode::EGCodeExtrusionRole::MagmaFloor:               { return _u8L("Magma floor"); }
+    case libvgcode::EGCodeExtrusionRole::MagmaCeiling:             { return _u8L("Magma ceiling"); }
     default:                                                       { return _u8L("Unknown"); }
     }
 }
@@ -1108,7 +1113,10 @@ void GCodeViewer::load_as_gcode(const GCodeProcessorResult& gcode_result, const 
             libvgcode::EGCodeExtrusionRole::WipeTower,
             // ORCA
             libvgcode::EGCodeExtrusionRole::BottomSurface, libvgcode::EGCodeExtrusionRole::InternalBridgeInfill, libvgcode::EGCodeExtrusionRole::Brim,
-            libvgcode::EGCodeExtrusionRole::SupportTransition, libvgcode::EGCodeExtrusionRole::Mixed
+            libvgcode::EGCodeExtrusionRole::SupportTransition, libvgcode::EGCodeExtrusionRole::Mixed,
+            // Magma
+            libvgcode::EGCodeExtrusionRole::MagmaInfill, libvgcode::EGCodeExtrusionRole::MagmaShell,
+            libvgcode::EGCodeExtrusionRole::MagmaFloor, libvgcode::EGCodeExtrusionRole::MagmaCeiling
             });
     m_paths_bounding_box = BoundingBoxf3(libvgcode::convert(bbox[0]).cast<double>(), libvgcode::convert(bbox[1]).cast<double>());
 
@@ -1289,6 +1297,11 @@ void GCodeViewer::load_as_preview(libvgcode::GCodeInputData&& data)
     m_viewer.set_extrusion_role_color(libvgcode::EGCodeExtrusionRole::InternalInfill,           { 255, 127, 127 });
     m_viewer.set_extrusion_role_color(libvgcode::EGCodeExtrusionRole::SolidInfill,              { 255, 127, 127 });
     m_viewer.set_extrusion_role_color(libvgcode::EGCodeExtrusionRole::WipeTower,                { 127, 255, 127 });
+    // Magma - unified warm volcanic palette
+    m_viewer.set_extrusion_role_color(libvgcode::EGCodeExtrusionRole::MagmaInfill,              { 255, 80, 30 });   // Hot Lava
+    m_viewer.set_extrusion_role_color(libvgcode::EGCodeExtrusionRole::MagmaShell,               { 180, 70, 50 });   // Ember
+    m_viewer.set_extrusion_role_color(libvgcode::EGCodeExtrusionRole::MagmaFloor,               { 160, 40, 80 });   // Wine
+    m_viewer.set_extrusion_role_color(libvgcode::EGCodeExtrusionRole::MagmaCeiling,             { 230, 160, 60 });  // Amber Gold
     m_viewer.load(std::move(data));
 
     const libvgcode::AABox bbox = m_viewer.get_extrusion_bounding_box();
@@ -1310,6 +1323,11 @@ void GCodeViewer::reset_shell()
     m_shells.volumes.clear();
     m_shells.print_id = -1;
     m_shell_bounding_box = BoundingBoxf3();
+
+    // Magma: Clear cache when model changes
+    m_magma_shells.volumes.clear();
+    m_magma_shells.cached_objects.clear();
+    m_magma_shells.cache_valid = false;
 }
 
 void GCodeViewer::reset()
@@ -1342,6 +1360,7 @@ void GCodeViewer::render(int canvas_width, int canvas_height, int right_margin)
 {
     glsafe(::glEnable(GL_DEPTH_TEST));
     render_shells(canvas_width, canvas_height);
+    render_magma_shells(canvas_width, canvas_height);  // Magma interior shell debug visualization
 
     if (m_viewer.get_extrusion_roles().empty())
         return;
@@ -2043,6 +2062,132 @@ void GCodeViewer::load_shells(const Print& print, bool initialized, bool force_p
         % m_shells.print_id % m_shells.print_modify_count % object_count %m_shells.volumes.volumes.size();
 }
 
+// Magma: Rebuild GLVolumes from cached stage data (called on stage change or after load)
+void GCodeViewer::rebuild_magma_volumes()
+{
+    m_magma_shells.volumes.clear();
+
+    if (!m_magma_shells.cache_valid)
+        return;
+
+    int stage_idx = static_cast<int>(m_magma_shells.stage);
+    int loaded_count = 0;
+
+    // Color varies by stage for easy identification
+    ColorRGBA magma_color;
+    switch (m_magma_shells.stage) {
+        case MagmaShellStage::Initial:
+            magma_color = ColorRGBA(0.9f, 0.3f, 0.3f, 0.55f);  // Red - raw
+            break;
+        case MagmaShellStage::Filtered:
+            magma_color = ColorRGBA(0.9f, 0.7f, 0.2f, 0.55f);  // Orange - filtered
+            break;
+        case MagmaShellStage::Smoothed:
+            magma_color = ColorRGBA(0.2f, 0.6f, 0.9f, 0.55f);  // Blue - final
+            break;
+    }
+
+    for (const auto& cached : m_magma_shells.cached_objects) {
+        if (!cached.has_data || cached.stage_meshes[stage_idx].empty())
+            continue;
+
+        for (const Transform3d& transform : cached.instance_transforms) {
+            GLVolume* v = m_magma_shells.volumes.new_nontoolpath_volume(magma_color);
+            v->model.init_from(cached.stage_meshes[stage_idx]);
+            v->set_instance_transformation(transform);
+            v->set_volume_transformation(Transform3d::Identity());
+            v->force_native_color = true;
+            v->zoom_to_volumes = false;
+            v->set_render_color();
+            loaded_count++;
+        }
+    }
+
+    std::cerr << "Magma DEBUG: Built " << loaded_count << " volumes for stage " << stage_idx << std::endl;
+}
+
+// Magma: Load and cache interior shell meshes for preview (called after slicing)
+void GCodeViewer::load_magma_shells(const Print& print)
+{
+    // Clear old cache and volumes
+    m_magma_shells.volumes.clear();
+    m_magma_shells.cached_objects.clear();
+    m_magma_shells.cache_valid = false;
+
+    if (print.objects().empty())
+        return;
+
+    std::cerr << "Magma DEBUG: Loading shells for " << print.objects().size() << " objects" << std::endl;
+
+    // Cache all stages for all objects
+    for (const PrintObject* obj : print.objects()) {
+        MagmaCachedObject cached;
+        const auto& stages = obj->magma_stages();
+        const ModelObject* model_obj = obj->model_object();
+
+        // Collect instance transforms (once per object)
+        for (size_t i = 0; i < model_obj->instances.size(); ++i) {
+            if (model_obj->instances[i]->is_printable()) {
+                cached.instance_transforms.push_back(
+                    model_obj->instances[i]->get_transformation().get_matrix());
+            }
+        }
+
+        // Cache each stage mesh (with transform removed)
+        const indexed_triangle_set* meshes[3] = {
+            &stages.initial, &stages.filtered, &stages.smoothed
+        };
+
+        for (int s = 0; s < 3; ++s) {
+            if (!meshes[s]->empty()) {
+                cached.stage_meshes[s] = TriangleMesh(*meshes[s]);
+                cached.stage_meshes[s].transform(obj->trafo_centered().inverse());
+                cached.has_data = true;
+                std::cerr << "Magma DEBUG: Cached stage " << s << " with "
+                          << meshes[s]->indices.size() << " triangles" << std::endl;
+            }
+        }
+
+        // Fallback: use final interior if stages empty
+        if (!cached.has_data && obj->has_magma_interior()) {
+            std::cerr << "Magma DEBUG: Using interior mesh fallback" << std::endl;
+            TriangleMesh mesh(obj->magma_interior_mesh());
+            mesh.transform(obj->trafo_centered().inverse());
+            for (int s = 0; s < 3; ++s) {
+                cached.stage_meshes[s] = mesh;
+            }
+            cached.has_data = true;
+        }
+
+        m_magma_shells.cached_objects.push_back(std::move(cached));
+    }
+
+    m_magma_shells.cache_valid = true;
+    rebuild_magma_volumes();
+}
+
+// Magma: Set stage and rebuild volumes (no Print access needed)
+void GCodeViewer::set_magma_shell_stage(MagmaShellStage stage)
+{
+    if (m_magma_shells.stage != stage) {
+        m_magma_shells.stage = stage;
+        rebuild_magma_volumes();  // Rebuild from cache, no Print needed
+    }
+}
+
+// Magma: Cycle through stages (no Print access needed)
+void GCodeViewer::cycle_magma_shell_stage()
+{
+    MagmaShellStage next;
+    switch (m_magma_shells.stage) {
+        case MagmaShellStage::Initial:  next = MagmaShellStage::Filtered; break;
+        case MagmaShellStage::Filtered: next = MagmaShellStage::Smoothed; break;
+        case MagmaShellStage::Smoothed: next = MagmaShellStage::Initial;  break;
+    }
+    set_magma_shell_stage(next);
+    std::cerr << "Magma DEBUG: Cycled to stage " << static_cast<int>(m_magma_shells.stage) << std::endl;
+}
+
 void GCodeViewer::render_toolpaths()
 {
     const Camera& camera = wxGetApp().plater()->get_camera();
@@ -2233,6 +2378,29 @@ void GCodeViewer::render_shells(int canvas_width, int canvas_height)
     shader->set_uniform("z_far", camera.get_far_z());
     shader->set_uniform("z_near", camera.get_near_z());
     m_shells.volumes.render(GLVolumeCollection::ERenderType::Transparent, false, camera.get_view_matrix(), camera.get_projection_matrix(), {canvas_width, canvas_height});
+    shader->set_uniform("emission_factor", 0.0f);
+    shader->stop_using();
+
+    glsafe(::glDepthMask(GL_TRUE));
+}
+
+void GCodeViewer::render_magma_shells(int canvas_width, int canvas_height)
+{
+    if (!m_magma_shells.visible || m_magma_shells.volumes.empty())
+        return;
+
+    GLShaderProgram* shader = wxGetApp().get_shader("gouraud_light");
+    if (shader == nullptr)
+        return;
+
+    glsafe(::glDepthMask(GL_FALSE));
+
+    shader->start_using();
+    shader->set_uniform("emission_factor", 0.15f);  // Slightly more glow than regular shells
+    const Camera& camera = wxGetApp().plater()->get_camera();
+    shader->set_uniform("z_far", camera.get_far_z());
+    shader->set_uniform("z_near", camera.get_near_z());
+    m_magma_shells.volumes.render(GLVolumeCollection::ERenderType::Transparent, false, camera.get_view_matrix(), camera.get_projection_matrix(), {canvas_width, canvas_height});
     shader->set_uniform("emission_factor", 0.0f);
     shader->stop_using();
 

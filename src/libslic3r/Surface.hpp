@@ -28,6 +28,13 @@ enum SurfaceType {
     stInternalVoid,
     // Inner/outer perimeters.
     stPerimeter,
+    // Magma infill surface types
+    // Outer zone filled with Magma U-tube pattern (hex or triangle)
+    stMagmaOuterInfill,
+    // Magma zone floor (no Magma below) - propagates solid upward into zone
+    stMagmaFloor,
+    // Magma zone ceiling (no Magma above) - propagates solid downward into zone
+    stMagmaCeiling,
     // Number of SurfaceType enums.
     stCount,
 };
@@ -109,8 +116,14 @@ public:
     bool   is_internal_bridge() const { return this->surface_type == stInternalBridge; }
 	bool   is_external() const { return this->is_top() || this->is_bottom(); }
 	bool   is_internal() const { return ! this->is_external(); }
-	bool   is_solid()    const { return this->is_external() || this->surface_type == stInternalSolid || this->surface_type == stInternalBridge; }
+	bool   is_solid()    const { return this->is_external() || this->surface_type == stInternalSolid || this->surface_type == stInternalBridge || this->is_magma_boundary() || this->is_magma_outer(); }
 	bool   is_solid_infill() const { return this->surface_type == stInternalSolid; }
+    // Magma surface type helpers
+    bool   is_magma_outer() const { return this->surface_type == stMagmaOuterInfill; }
+    bool   is_magma_floor() const { return this->surface_type == stMagmaFloor; }
+    bool   is_magma_ceiling() const { return this->surface_type == stMagmaCeiling; }
+    bool   is_magma_boundary() const { return is_magma_floor() || is_magma_ceiling(); }
+    bool   is_magma()       const { return is_magma_outer() || is_magma_boundary(); }
 };
 
 typedef std::vector<Surface> Surfaces;

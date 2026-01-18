@@ -859,7 +859,20 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
                     params.symmetric_infill_y_axis = region_config.symmetric_infill_y_axis;
                 }
 
-                if (surface.is_solid()) {
+                // Magma zone pattern handling - must come before is_solid() check
+                // Magma outer uses configured pattern (sparse during print, solid after injection)
+                // Magma floor/ceiling use solid infill (they're the shell layers)
+                // Magma inner uses user's sparse infill pattern (already set as default above)
+                if (surface.is_magma_outer()) {
+                    // Convert MagmaPattern enum to InfillPattern enum
+                    params.pattern = (region_config.magma_pattern.value == MagmaPattern::Triangle)
+                                     ? ipMagmaTriangle : ipMagmaHex;
+                    // Keep sparse density - pattern is sparse until post-print injection
+                } else if (surface.is_magma_boundary()) {
+                    // Magma floor/ceiling are solid shell surfaces
+                    params.pattern = region_config.internal_solid_infill_pattern.value;
+                    params.density = 100.f;
+                } else if (surface.is_solid()) {
                     if (surface.is_external() && !is_bridge) {
                         if (surface.is_top()) {
                             params.pattern = region_config.top_surface_pattern.value;
@@ -887,6 +900,12 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
                         params.extrusion_role = erInternalBridgeInfill;
                     else
                         params.extrusion_role = erBridgeInfill;
+                } else if (surface.is_magma_outer()) {
+                    params.extrusion_role = erMagmaInfill;
+                } else if (surface.is_magma_ceiling()) {
+                    params.extrusion_role = erMagmaCeiling;
+                } else if (surface.is_magma_floor()) {
+                    params.extrusion_role = erMagmaFloor;
                 } else if (surface.is_solid()) {
                     if (surface.is_top()) {
                         params.extrusion_role = erTopSolidInfill;
@@ -930,6 +949,17 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
                         params.top_surface_speed = region_config.top_surface_speed;
                     } else if (params.extrusion_role == erSolidInfill)
                         params.solid_infill_speed = region_config.internal_solid_infill_speed;
+                    else if (params.extrusion_role == erBottomSurface)
+                        params.solid_infill_speed = region_config.internal_solid_infill_speed;
+                    else if (params.extrusion_role == erMagmaInfill)
+                        // Magma outer infill (U-tubes) uses sparse infill speed
+                        params.sparse_infill_speed = region_config.sparse_infill_speed;
+                    else if (params.extrusion_role == erMagmaFloor)
+                        // Magma floor uses internal solid infill speed
+                        params.solid_infill_speed = region_config.internal_solid_infill_speed;
+                    else if (params.extrusion_role == erMagmaCeiling)
+                        // Magma ceiling uses top surface speed (may need bridging)
+                        params.top_surface_speed = region_config.top_surface_speed;
                 }
 				// Calculate flow spacing for infill pattern generation.
 		        if (surface.is_solid() || is_bridge) {

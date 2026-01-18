@@ -88,6 +88,11 @@ Slic3r::ExtrusionRole convert(EGCodeExtrusionRole role)
     case EGCodeExtrusionRole::Brim:                     { return Slic3r::ExtrusionRole::erBrim; }
     case EGCodeExtrusionRole::SupportTransition:        { return Slic3r::ExtrusionRole::erSupportTransition; }
     case EGCodeExtrusionRole::Mixed:                    { return Slic3r::ExtrusionRole::erMixed; }
+    // Magma
+    case EGCodeExtrusionRole::MagmaInfill:              { return Slic3r::ExtrusionRole::erMagmaInfill; }
+    case EGCodeExtrusionRole::MagmaShell:               { return Slic3r::ExtrusionRole::erMagmaShell; }
+    case EGCodeExtrusionRole::MagmaFloor:               { return Slic3r::ExtrusionRole::erMagmaFloor; }
+    case EGCodeExtrusionRole::MagmaCeiling:             { return Slic3r::ExtrusionRole::erMagmaCeiling; }
     default:                                            { return Slic3r::ExtrusionRole::erNone; }
     }
 }
@@ -117,6 +122,11 @@ EGCodeExtrusionRole convert(Slic3r::ExtrusionRole role)
     case Slic3r::ExtrusionRole::erBrim:                        { return EGCodeExtrusionRole::Brim; }
     case Slic3r::ExtrusionRole::erSupportTransition:           { return EGCodeExtrusionRole::SupportTransition; }
     case Slic3r::ExtrusionRole::erMixed:                       { return EGCodeExtrusionRole::Mixed; }
+    // Magma
+    case Slic3r::ExtrusionRole::erMagmaInfill:                 { return EGCodeExtrusionRole::MagmaInfill; }
+    case Slic3r::ExtrusionRole::erMagmaShell:                  { return EGCodeExtrusionRole::MagmaShell; }
+    case Slic3r::ExtrusionRole::erMagmaFloor:                  { return EGCodeExtrusionRole::MagmaFloor; }
+    case Slic3r::ExtrusionRole::erMagmaCeiling:                { return EGCodeExtrusionRole::MagmaCeiling; }
     default:                                                   { return EGCodeExtrusionRole::None; }
     }
 }

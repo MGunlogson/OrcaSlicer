@@ -68,6 +68,11 @@ struct Settings
 		        true, // Brim
 		        true, // SupportTransition
 		        true, // Mixed
+		        // Magma
+		        true, // MagmaInfill
+		        true, // MagmaShell
+		        true, // MagmaFloor
+		        true, // MagmaCeiling
 		};
 };
 

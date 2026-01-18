@@ -221,9 +221,19 @@ static t_config_enum_values s_keys_map_InfillPattern {
     { "concentric", ipConcentric },
     { "hilbertcurve", ipHilbertCurve },
     { "archimedeanchords", ipArchimedeanChords },
-    { "octagramspiral", ipOctagramSpiral }
+    { "octagramspiral", ipOctagramSpiral },
+    // Magma infill patterns for vertical reinforcement
+    { "magmahex", ipMagmaHex },
+    { "magmatriangle", ipMagmaTriangle }
 };
 CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(InfillPattern)
+
+// Magma pattern selection (separate enum for dropdown UI)
+static t_config_enum_values s_keys_map_MagmaPattern {
+    { "triangle", int(MagmaPattern::Triangle) },
+    { "hex", int(MagmaPattern::Hex) }
+};
+CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(MagmaPattern)
 
 static t_config_enum_values s_keys_map_IroningType {
     { "no ironing",     int(IroningType::NoIroning) },
@@ -2785,6 +2795,9 @@ void PrintConfigDef::init_fff_params()
     def->enum_values.push_back("hilbertcurve");
     def->enum_values.push_back("archimedeanchords");
     def->enum_values.push_back("octagramspiral");
+    // Magma infill patterns
+    def->enum_values.push_back("magmahex");
+    def->enum_values.push_back("magmatriangle");
     def->enum_labels.push_back(L("Rectilinear"));
     def->enum_labels.push_back(L("Aligned Rectilinear"));
     def->enum_labels.push_back(L("Zig Zag"));
@@ -2811,6 +2824,9 @@ void PrintConfigDef::init_fff_params()
     def->enum_labels.push_back(L("Hilbert Curve"));
     def->enum_labels.push_back(L("Archimedean Chords"));
     def->enum_labels.push_back(L("Octagram Spiral"));
+    // Magma infill patterns
+    def->enum_labels.push_back(L("Magma Hex"));
+    def->enum_labels.push_back(L("Magma Triangle"));
     def->set_default_value(new ConfigOptionEnum<InfillPattern>(ipCrossHatch));
 
     def           = this->add("lateral_lattice_angle_1", coFloat);
@@ -5081,6 +5097,154 @@ void PrintConfigDef::init_fff_params()
     def->label = L("Scarf joint for inner walls");
     def->tooltip = L("Use scarf joint for inner walls as well.");
     def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
+    // Magma infill configuration
+    def = this->add("magma_inner_shell_enabled", coBool);
+    def->label = L("Enable inner shell");
+    def->category = L("Strength");
+    def->tooltip = L("Enable Magma inner shell to divide the infill region into outer (Magma solid infill) and inner (lightweight infill) zones. "
+                     "This creates a boundary of wall-like structures between the two zones for vertical reinforcement.\n\n"
+                     "Note: Your sparse infill settings (pattern and density) will apply to the inner zone inside the shell.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("magma_pattern", coEnum);
+    def->label = L("Pattern");
+    def->category = L("Strength");
+    def->tooltip = L("Pattern for the Magma outer infill zone. Triangle provides better interlocking with 3-layer cycles, "
+                     "while Hex offers smoother flow characteristics.");
+    def->enum_keys_map = &ConfigOptionEnum<MagmaPattern>::get_enum_values();
+    def->enum_values.push_back("triangle");
+    def->enum_values.push_back("hex");
+    def->enum_labels.push_back(L("Triangle"));
+    def->enum_labels.push_back(L("Hex"));
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionEnum<MagmaPattern>(MagmaPattern::Triangle));
+
+    def = this->add("magma_outer_infill_width", coFloat);
+    def->label = L("Outer zone width");
+    def->category = L("Strength");
+    def->tooltip = L("Width of the outer infill zone that will be filled with solid Magma infill. "
+                     "This is measured inward from the outer walls. Set to 0 to disable Magma zones.");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->max = 50;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(2.0));
+
+    def = this->add("magma_inner_shell_line_count", coInt);
+    def->label = L("Inner shell wall count");
+    def->category = L("Strength");
+    def->tooltip = L("Number of wall lines for the inner shell boundary between outer and inner infill zones.");
+    def->min = 1;
+    def->max = 10;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionInt(1));
+
+    def = this->add("magma_inner_shell_line_width", coFloatOrPercent);
+    def->label = L("Inner shell line width");
+    def->category = L("Strength");
+    def->tooltip = L("Width of the inner shell wall lines. Set to 0 for auto (uses perimeter spacing). "
+                     "Can also be specified as a percentage of the nozzle diameter.");
+    def->sidetext = L("mm or %");
+    def->ratio_over = "nozzle_diameter";
+    def->min = 0;
+    def->max = 2;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloatOrPercent(0, false));
+
+    def = this->add("magma_min_yolk_width", coFloat);
+    def->label = L("Minimum yolk width");
+    def->category = L("Strength");
+    def->tooltip = L("Minimum width of inner yolk regions in any direction. Thin sections and small "
+                     "disconnected yolk regions narrower than this will be removed during 3D shell "
+                     "computation. This prevents small artifacts from creating unusable infill zones.\n\n"
+                     "Set to 0 to disable filtering.");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->max = 50;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(5.0));
+
+    def = this->add("magma_shell_solid_layers", coInt);
+    def->label = L("Top and bottom layers");
+    def->category = L("Strength");
+    def->tooltip = L("Minimum number of solid infill layers at Magma shell floor and ceiling transitions. "
+                     "These layers use internal solid infill to create structural floors/ceilings "
+                     "where the shell meets the rest of the model.");
+    def->sidetext = L("layers");
+    def->min = 1;
+    def->max = 10;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionInt(2));
+
+    def = this->add("magma_shell_solid_thickness", coFloat);
+    def->label = L("Top and bottom thickness");
+    def->category = L("Strength");
+    def->tooltip = L("Minimum thickness of solid infill at Magma shell floor and ceiling transitions. "
+                     "Floor/ceiling detection uses both layer count AND thickness - whichever requires "
+                     "more layers wins. Set to 0 to use only layer count.");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->max = 10;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0.5));
+
+    def = this->add("magma_infill_speed", coFloat);
+    def->label = L("Infill speed");
+    def->category = L("Speed");
+    def->tooltip = L("Speed for Magma outer infill (U-tube channels). "
+                     "Set to 0 to use sparse infill speed.");
+    def->sidetext = L("mm/s");
+    def->min = 0;
+    def->max = 1000;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0));
+
+    def = this->add("magma_shell_speed", coFloat);
+    def->label = L("Shell speed");
+    def->category = L("Speed");
+    def->tooltip = L("Speed for Magma inner shell perimeter walls. "
+                     "Set to 0 to use inner wall speed.");
+    def->sidetext = L("mm/s");
+    def->min = 0;
+    def->max = 1000;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0));
+
+    def = this->add("magma_floor_speed", coFloat);
+    def->label = L("Floor speed");
+    def->category = L("Speed");
+    def->tooltip = L("Speed for Magma floor surfaces (bottom of shell zone). "
+                     "Set to 0 to use internal solid infill speed.");
+    def->sidetext = L("mm/s");
+    def->min = 0;
+    def->max = 1000;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0));
+
+    def = this->add("magma_ceiling_speed", coFloat);
+    def->label = L("Ceiling speed");
+    def->category = L("Speed");
+    def->tooltip = L("Speed for Magma ceiling surfaces (top of shell zone). "
+                     "Set to 0 to use top surface speed.");
+    def->sidetext = L("mm/s");
+    def->min = 0;
+    def->max = 1000;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0));
+
+    def = this->add("magma_debug_export_shells", coBool);
+    def->label = L("Debug: export shell STLs");
+    def->category = L("Strength");
+    def->tooltip = L("Export intermediate Magma shell meshes as STL files for debugging. "
+                     "Files are saved to the application's debug output directory with names like:\n"
+                     "  magma_shell_1_initial.stl\n"
+                     "  magma_shell_2_filtered.stl\n"
+                     "  magma_shell_3_smoothed.stl\n\n"
+                     "Enable Developer Mode in Preferences to see this option.");
+    def->mode = comDevelop;
     def->set_default_value(new ConfigOptionBool(false));
 
     def = this->add("role_based_wipe_speed", coBool);
@@ -7784,8 +7948,7 @@ DynamicPrintConfig* DynamicPrintConfig::new_from_defaults_keys(const std::vector
 
 double min_object_distance(const ConfigBase &cfg)
 {
-    const ConfigOptionEnum<PrinterTechnology> *opt_printer_technology = cfg.option<ConfigOptionEnum<PrinterTechnology>>("printer_technology");
-    auto printer_technology = opt_printer_technology ? opt_printer_technology->value : ptUnknown;
+    auto printer_technology = cfg.opt_enum_or<PrinterTechnology>("printer_technology", ptUnknown);
 
     double ret = 0.;
 

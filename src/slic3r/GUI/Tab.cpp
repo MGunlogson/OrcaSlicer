@@ -2454,6 +2454,16 @@ void TabPrint::build()
         optgroup->append_single_option_line("filter_out_gap_fill", "strength_settings_infill#filter-out-tiny-gaps");
         optgroup->append_single_option_line("infill_wall_overlap", "strength_settings_infill#infill-wall-overlap");
 
+        optgroup = page->new_optgroup(L("Magma"), L"param_magma");
+        optgroup->append_single_option_line("magma_inner_shell_enabled");
+        optgroup->append_single_option_line("magma_pattern");
+        optgroup->append_single_option_line("magma_outer_infill_width");
+        optgroup->append_single_option_line("magma_inner_shell_line_count");
+        optgroup->append_single_option_line("magma_inner_shell_line_width");
+        optgroup->append_single_option_line("magma_min_yolk_width");
+        optgroup->append_single_option_line("magma_shell_solid_layers");
+        optgroup->append_single_option_line("magma_shell_solid_thickness");
+
         optgroup = page->new_optgroup(L("Advanced"), L"param_advanced");
         optgroup->append_single_option_line("align_infill_direction_to_model", "strength_settings_advanced#align-infill-direction-to-model");
         optgroup->append_single_option_line("extra_solid_infills", "strength_settings_infill#extra-solid-infill");
@@ -2530,6 +2540,12 @@ void TabPrint::build()
         optgroup->append_single_option_line("max_volumetric_extrusion_rate_slope", "speed_settings_advanced");
         optgroup->append_single_option_line("max_volumetric_extrusion_rate_slope_segment_length", "speed_settings_advanced");
         optgroup->append_single_option_line("extrusion_rate_smoothing_external_perimeter_only", "speed_settings_advanced");
+
+        optgroup = page->new_optgroup(L("Magma speed"), L"param_magma", 15);
+        optgroup->append_single_option_line("magma_infill_speed");
+        optgroup->append_single_option_line("magma_shell_speed");
+        optgroup->append_single_option_line("magma_floor_speed");
+        optgroup->append_single_option_line("magma_ceiling_speed");
 
     page = add_options_page(L("Support"), "custom-gcode_support"); // ORCA: icon only visible on placeholders
         optgroup = page->new_optgroup(L("Support"), L"param_support");

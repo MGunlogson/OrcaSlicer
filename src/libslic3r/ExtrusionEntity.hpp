@@ -37,6 +37,14 @@ enum ExtrusionRole : uint8_t {
     erSupportTransition,
     erWipeTower,
     erCustom,
+    // Magma solid infill for vertical reinforcement
+    erMagmaInfill,
+    // Magma inner shell walls (perimeters between outer and inner zones)
+    erMagmaShell,
+    // Magma floor (bottom of shell zone, solid)
+    erMagmaFloor,
+    // Magma ceiling (top of shell zone, bridges over yolk)
+    erMagmaCeiling,
     // Extrusion role for a collection with multiple extrusion roles.
     erMixed,
     erCount
@@ -78,7 +86,11 @@ inline bool is_infill(ExtrusionRole role)
         || role == erSolidInfill
         || role == erTopSolidInfill
         || role == erBottomSurface
-        || role == erIroning;
+        || role == erIroning
+        || role == erMagmaInfill
+        || role == erMagmaShell
+        || role == erMagmaFloor
+        || role == erMagmaCeiling;
 }
 
 inline bool is_top_surface(ExtrusionRole role)
@@ -88,12 +100,24 @@ inline bool is_top_surface(ExtrusionRole role)
 
 inline bool is_solid_infill(ExtrusionRole role)
 {
+    // All Magma roles are solid:
+    // - erMagmaInfill: U-tubes become solid after injection before next layer
+    // - erMagmaShell, erMagmaFloor, erMagmaCeiling: solid fill surfaces
     return role == erBridgeInfill
         || role == erInternalBridgeInfill
         || role == erSolidInfill
         || role == erTopSolidInfill
         || role == erBottomSurface
-        || role == erIroning;
+        || role == erIroning
+        || role == erMagmaInfill
+        || role == erMagmaShell
+        || role == erMagmaFloor
+        || role == erMagmaCeiling;
+}
+
+inline bool is_magma(ExtrusionRole role)
+{
+    return role == erMagmaInfill || role == erMagmaShell || role == erMagmaFloor || role == erMagmaCeiling;
 }
 
 inline bool is_bridge(ExtrusionRole role) {

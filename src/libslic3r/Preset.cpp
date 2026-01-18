@@ -895,6 +895,8 @@ static std::vector<std::string> s_Preset_print_options {
     "infill_direction", "solid_infill_direction", "counterbore_hole_bridging","infill_shift_step", "sparse_infill_rotate_template", "solid_infill_rotate_template", "symmetric_infill_y_axis","skeleton_infill_density", "infill_lock_depth", "skin_infill_depth", "skin_infill_density",
     "align_infill_direction_to_model", "extra_solid_infills",
     "minimum_sparse_infill_area", "reduce_infill_retraction","internal_solid_infill_pattern","gap_fill_target",
+     "magma_inner_shell_enabled", "magma_pattern", "magma_outer_infill_width", "magma_inner_shell_line_count", "magma_inner_shell_line_width", "magma_min_yolk_width",
+     "magma_shell_solid_layers", "magma_shell_solid_thickness", "magma_infill_speed", "magma_shell_speed", "magma_floor_speed", "magma_ceiling_speed",
     "ironing_type", "ironing_pattern", "ironing_flow", "ironing_speed", "ironing_spacing", "ironing_angle", "ironing_angle_fixed", "ironing_inset",
     "support_ironing", "support_ironing_pattern", "support_ironing_flow", "support_ironing_spacing",
     "max_travel_detour_distance",

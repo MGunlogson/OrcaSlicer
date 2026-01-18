@@ -5988,10 +5988,13 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
 #endif
         } else if (m_config.get_abs_value("bridge_acceleration") > 0 && is_bridge(path.role())) {
             acceleration = m_config.get_abs_value("bridge_acceleration");
-        } else if (m_config.get_abs_value("sparse_infill_acceleration") > 0 && (path.role() == erInternalInfill)) {
+        } else if (m_config.get_abs_value("sparse_infill_acceleration") > 0 && (path.role() == erInternalInfill || path.role() == erMagmaInfill)) {
             acceleration = m_config.get_abs_value("sparse_infill_acceleration");
-        } else if (m_config.get_abs_value("internal_solid_infill_acceleration") > 0 && (path.role() == erSolidInfill)) {
+        } else if (m_config.get_abs_value("internal_solid_infill_acceleration") > 0 && (path.role() == erSolidInfill || path.role() == erMagmaFloor || path.role() == erMagmaCeiling)) {
             acceleration = m_config.get_abs_value("internal_solid_infill_acceleration");
+        } else if (m_config.inner_wall_acceleration.value > 0 && path.role() == erMagmaShell) {
+            // Magma shell uses inner wall acceleration
+            acceleration = m_config.inner_wall_acceleration.value;
         } else if (m_config.outer_wall_acceleration.value > 0 && is_external_perimeter(path.role())) {
             acceleration = m_config.outer_wall_acceleration.value;
         } else if (m_config.inner_wall_acceleration.value > 0 && is_internal_perimeter(path.role())) {
@@ -6053,10 +6056,13 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
             _mm3_per_mm *= m_config.inner_wall_flow_ratio;
         } else if (path.role() == erOverhangPerimeter) {
             _mm3_per_mm *= m_config.overhang_flow_ratio;
-        } else if (path.role() == erInternalInfill) {
+        } else if (path.role() == erInternalInfill || path.role() == erMagmaInfill) {
             _mm3_per_mm *= m_config.sparse_infill_flow_ratio;
         } else if (path.role() == erSolidInfill) {
             _mm3_per_mm *= m_config.internal_solid_infill_flow_ratio;
+        } else if (path.role() == erMagmaShell) {
+            // Magma shell uses inner wall flow ratio
+            _mm3_per_mm *= m_config.inner_wall_flow_ratio;
         } else if (path.role() == erGapFill) {
             _mm3_per_mm *= m_config.gap_fill_flow_ratio;
         } else if (path.role() == erSupportMaterial) { // Should this condition also cover erSupportTransition?
@@ -6111,6 +6117,26 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
             const double  support_speed = m_config.support_speed.value;
             const double  support_interface_speed = m_config.get_abs_value("support_interface_speed");
             speed = (path.role() == erSupportMaterial) ? support_speed : support_interface_speed;
+        } else if (path.role() == erMagmaShell) {
+            // Magma shell perimeters - use config or default to inner wall speed
+            speed = m_config.magma_shell_speed.value;
+            if (speed == 0)
+                speed = m_config.get_abs_value("inner_wall_speed");
+        } else if (path.role() == erMagmaInfill) {
+            // Magma outer infill (U-tubes) - use config or default to sparse infill speed
+            speed = m_config.magma_infill_speed.value;
+            if (speed == 0)
+                speed = m_config.get_abs_value("sparse_infill_speed");
+        } else if (path.role() == erMagmaFloor) {
+            // Magma floor (bottom of shell zone) - use config or default to solid infill speed
+            speed = m_config.magma_floor_speed.value;
+            if (speed == 0)
+                speed = m_config.get_abs_value("internal_solid_infill_speed");
+        } else if (path.role() == erMagmaCeiling) {
+            // Magma ceiling (top of shell zone) - use config or default to top surface speed
+            speed = m_config.magma_ceiling_speed.value;
+            if (speed == 0)
+                speed = m_config.get_abs_value("top_surface_speed");
         } else {
             throw Slic3r::InvalidArgument("Invalid speed");
         }
@@ -6775,6 +6801,10 @@ std::string GCode::extrusion_role_to_string_for_parser(const ExtrusionRole & rol
         case erSupportMaterialInterface: return "SupportMaterialInterface";
         case erSupportTransition: return "SupportTransition";
         case erWipeTower: return "WipeTower";
+        case erMagmaShell: return "MagmaShell";
+        case erMagmaInfill: return "MagmaInfill";
+        case erMagmaFloor: return "MagmaFloor";
+        case erMagmaCeiling: return "MagmaCeiling";
         case erCustom:
         case erMixed:
         case erCount:

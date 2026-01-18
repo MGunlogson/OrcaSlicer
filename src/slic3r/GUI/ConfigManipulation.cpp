@@ -873,6 +873,13 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, co
         toggle_line(el, have_arachne);
     toggle_field("detect_thin_wall", !have_arachne);
 
+    // Magma infill settings
+    bool have_magma = config->opt_bool("magma_inner_shell_enabled");
+    for (auto el : { "magma_pattern", "magma_outer_infill_width", "magma_inner_shell_line_count",
+        "magma_inner_shell_line_width", "magma_min_yolk_width",
+        "magma_shell_solid_layers", "magma_shell_solid_thickness" })
+        toggle_line(el, have_magma);
+
     // Orca
     auto is_role_based_wipe_speed = config->opt_bool("role_based_wipe_speed");
     toggle_field("wipe_speed",!is_role_based_wipe_speed);

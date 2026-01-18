@@ -56,6 +56,10 @@ public:
     // BBS: Unspecified fill polygons, used for interecting when we don't want the infill/perimeter overlap
     ExPolygons                  fill_no_overlap_expolygons;
 
+    // Magma: The yolk (interior) region inside Magma shells
+    // Used to clip floor/ceiling surfaces so they stay within the shell boundary
+    ExPolygons                  magma_yolk;
+
     // collection of expolygons representing the bridged areas (thus not
     // needing support material)
 //    Polygons                    bridged;
@@ -156,6 +160,10 @@ public:
     // BBS
     ExPolygons              loverhangs;
     BoundingBox             loverhangs_bbox;
+
+    // Magma: Zone boundary from 3D shell computation
+    // Separates outer Magma zone from inner lightweight zone
+    ExPolygons              magma_zone_boundary;
     size_t                  region_count() const { return m_regions.size(); }
     const LayerRegion*      get_region(int idx) const { return m_regions[idx]; }
     LayerRegion*            get_region(int idx) { return m_regions[idx]; }

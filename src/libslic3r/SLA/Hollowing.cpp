@@ -22,26 +22,6 @@
 namespace Slic3r {
 namespace sla {
 
-struct Interior {
-    indexed_triangle_set mesh;
-    openvdb::FloatGrid::Ptr gridptr;
-    mutable std::optional<openvdb::FloatGrid::ConstAccessor> accessor;
-
-    double closing_distance = 0.;
-    double thickness = 0.;
-    double voxel_scale = 1.;
-    double nb_in = 3.;  // narrow band width inwards
-    double nb_out = 3.; // narrow band width outwards
-    // Full narrow band is the sum of the two above values.
-
-    void reset_accessor() const  // This resets the accessor and its cache
-    // Not a thread safe call!
-    {
-        if (gridptr)
-            accessor = gridptr->getConstAccessor();
-    }
-};
-
 void InteriorDeleter::operator()(Interior *p)
 {
     delete p;

@@ -302,6 +302,11 @@ static const std::array<Color, size_t(EGCodeExtrusionRole::COUNT)> DEFAULT_EXTRU
     {   0,  59, 110 }, // Brim
     {   0,  64,   0 }, // SupportTransition
     { 128, 128, 128 }, // Mixed
+    // Magma - unified warm volcanic palette
+    { 255,  80,  30 }, // MagmaInfill - Hot Lava (bright orange-red)
+    { 180,  70,  50 }, // MagmaShell - Ember (warm brown-red)
+    { 160,  40,  80 }, // MagmaFloor - Wine (deep magenta-red)
+    { 230, 160,  60 }, // MagmaCeiling - Amber Gold (warm amber)
 } };
 
 static const std::array<Color, size_t(EOptionType::COUNT)> DEFAULT_OPTIONS_COLORS{ {
