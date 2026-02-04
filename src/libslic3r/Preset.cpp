@@ -900,7 +900,7 @@ static std::vector<std::string> s_Preset_print_options {
      "dual_infill_solid_layers", "dual_infill_solid_thickness", "dual_infill_outer_speed", "dual_infill_shell_speed", "dual_infill_floor_speed", "dual_infill_ceiling_speed",
      // Magma Triangle pattern-specific options
      "magma_interior_width", "magma_window_height", "magma_tube_height_layers", "magma_tube_height", "magma_stagger_levels", "magma_fill_depth_factor", "magma_tube_fill_factor", "magma_spiral_interlock",
-     "magma_injection_temp", "magma_injection_speed", "magma_iron_tube_ends", "magma_injection_park", "magma_injection_dwell",
+     "magma_injection_temp", "magma_injection_speed", "magma_iron_tube_ends", "magma_injection_park", "magma_injection_dwell", "magma_injection_z_slam", "magma_injection_filament",
     "ironing_type", "ironing_pattern", "ironing_flow", "ironing_speed", "ironing_spacing", "ironing_angle", "ironing_angle_fixed", "ironing_inset",
     "support_ironing", "support_ironing_pattern", "support_ironing_flow", "support_ironing_spacing",
     "max_travel_detour_distance",

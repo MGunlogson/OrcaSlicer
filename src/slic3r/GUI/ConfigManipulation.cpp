@@ -897,7 +897,8 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, co
 
     // Magma Injection section
     for (auto el : { "magma_injection_temp", "magma_injection_speed", "magma_iron_tube_ends",
-        "magma_injection_park", "magma_injection_dwell" })
+        "magma_injection_park", "magma_injection_dwell", "magma_injection_z_slam",
+        "magma_injection_filament" })
         toggle_line(el, have_magma_pattern);
 
     // Orca

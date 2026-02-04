@@ -5365,6 +5365,26 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionInt(0));
 
+    def = this->add("magma_injection_z_slam", coBool);
+    def->label = L("Injection Z-slam seal");
+    def->category = L("Strength");
+    def->tooltip = L("Lower the nozzle 0.1mm into the print surface during injection "
+                     "to seal against the hole and reduce leakage. The nozzle stays "
+                     "pressed down during extrusion and dwell, then returns to normal height.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(true));
+
+    def = this->add("magma_injection_filament", coInt);
+    def->gui_type = ConfigOptionDef::GUIType::i_enum_open;
+    def->label = L("Injection filament");
+    def->category = L("Extruders");
+    def->tooltip = L("Filament to use for Magma tube injection. Use a different filament "
+                     "for injection when you want the reinforcement material to differ from "
+                     "the print material. 0 = use the current printing filament.");
+    def->min = 0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionInt(0));
+
     def = this->add("role_based_wipe_speed", coBool);
     def->label = L("Role base wipe speed");
     def->tooltip = L("The wipe speed is determined by the speed of the current extrusion role. "

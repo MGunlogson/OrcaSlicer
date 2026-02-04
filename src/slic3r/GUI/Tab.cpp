@@ -2479,8 +2479,10 @@ void TabPrint::build()
         optgroup->append_single_option_line("magma_injection_temp");
         optgroup->append_single_option_line("magma_injection_speed");
         optgroup->append_single_option_line("magma_injection_dwell");
+        optgroup->append_single_option_line("magma_injection_z_slam");
         optgroup->append_single_option_line("magma_injection_park");
         optgroup->append_single_option_line("magma_iron_tube_ends");
+        optgroup->append_single_option_line("magma_injection_filament");
 
         optgroup = page->new_optgroup(L("Advanced"), L"param_advanced");
         optgroup->append_single_option_line("align_infill_direction_to_model", "strength_settings_advanced#align-infill-direction-to-model");

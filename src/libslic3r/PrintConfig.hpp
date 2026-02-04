@@ -1023,6 +1023,9 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionInt,  interlocking_depth))
     ((ConfigOptionInt,  interlocking_boundary_avoidance))
 
+    // Magma injection filament (object-level, like support_filament)
+    ((ConfigOptionInt,                  magma_injection_filament))     // Filament for injection (0 = current)
+
     // Orca: internal use only
     ((ConfigOptionBool,  calib_flowrate_topinfill_special_order)) // ORCA: special flag for flow rate calibration
 
@@ -1220,6 +1223,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionBool,                 magma_iron_tube_ends))         // Iron over tube ends after injection
     ((ConfigOptionBool,                 magma_injection_park))         // Park nozzle during temp changes
     ((ConfigOptionInt,                  magma_injection_dwell))        // Dwell time after injection (ms)
+    ((ConfigOptionBool,                 magma_injection_z_slam))       // Z-slam seal during injection
 )
 
 PRINT_CONFIG_CLASS_DEFINE(

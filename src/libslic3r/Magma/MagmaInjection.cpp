@@ -85,16 +85,29 @@ std::string generate_injection_gcode(
 
     std::string gcode;
     const auto& config = gcodegen.config();
+    char buf[256];
 
     // --- Config values ---
-    int injection_temp   = config.magma_injection_temp.value;
-    double injection_speed_vol = config.magma_injection_speed.value; // mm^3/s, 0 = auto
-    bool iron_tube_ends  = config.magma_iron_tube_ends.value;
-    bool park_enabled    = config.magma_injection_park.value;
-    int dwell_ms         = config.magma_injection_dwell.value;
-    double fill_factor   = config.magma_tube_fill_factor.value;
+    int injection_temp       = config.magma_injection_temp.value;
+    double injection_speed_vol = config.magma_injection_speed.value;
+    bool iron_tube_ends      = config.magma_iron_tube_ends.value;
+    bool park_enabled        = config.magma_injection_park.value;
+    int dwell_ms             = config.magma_injection_dwell.value;
+    double fill_factor       = config.magma_tube_fill_factor.value;
+    bool z_slam              = config.magma_injection_z_slam.value;
+    int inj_filament         = config.magma_injection_filament.value;
 
-    // Get current extruder info
+    // --- Filament switch (before any injection) ---
+    unsigned int original_filament = gcodegen.writer().filament()->id();
+    bool need_filament_switch = (inj_filament > 0 &&
+                                 (unsigned int)(inj_filament - 1) != original_filament);
+
+    if (need_filament_switch) {
+        gcode += "; Magma injection: switching to injection filament\n";
+        gcode += gcodegen.set_extruder(inj_filament - 1, layer_z);
+    }
+
+    // Get extruder info (may have changed after filament switch)
     unsigned int extruder_id = gcodegen.writer().filament()->id();
     double filament_diameter = config.filament_diameter.get_at(extruder_id);
     double filament_area = (M_PI / 4.0) * filament_diameter * filament_diameter;
@@ -102,11 +115,6 @@ std::string generate_injection_gcode(
     // Injection volumetric speed.
     // Default (0) uses the infill volumetric rate — this represents the
     // hotend's proven melt capacity during normal printing.
-    // Tube depth is calculated separately using a coupled pressure+thermal
-    // model (see MagmaTubeMap::build). The extruder self-limits against
-    // tube back-pressure: if commanded speed exceeds what pressure allows,
-    // the extruder pushes slower. Adjust magma_tube_fill_factor if tubes
-    // are underfilled due to this effect.
     double vol_speed;
     if (injection_speed_vol > 0) {
         vol_speed = injection_speed_vol;
@@ -115,7 +123,6 @@ std::string generate_injection_gcode(
         if (max_vol > 0) {
             vol_speed = max_vol;
         } else {
-            // Derive from infill speed — proven melt rate for this hotend
             float nozzle_d = config.nozzle_diameter.get_at(extruder_id);
             float line_width = config.sparse_infill_line_width.get_abs_value(nozzle_d);
             if (line_width <= 0) line_width = nozzle_d;
@@ -141,35 +148,33 @@ std::string generate_injection_gcode(
     int print_temp = config.nozzle_temperature.get_at(extruder_id);
 
     // Convert volumetric speed to filament feedrate
-    double feedrate_mms = vol_speed / filament_area;   // mm/s of filament
-    double feedrate_mmmin = feedrate_mms * 60.0;       // for G-code F parameter
+    double feedrate_mms = vol_speed / filament_area;
+    double feedrate_mmmin = feedrate_mms * 60.0;
 
     // --- Heat up ---
-    bool temp_changed = (injection_temp > 0 && injection_temp != print_temp);
+    // Skip if filament switch already handled temperature via set_extruder()
+    bool temp_changed = (injection_temp > 0 && injection_temp != print_temp
+                         && !need_filament_switch);
     if (temp_changed) {
         gcode += "; Magma injection: heating\n";
         gcode += gcodegen.retract(false, false);
 
         if (park_enabled) {
-            // Park at front-left of bed (simple approach)
-            // A more sophisticated version could use OozePrevention logic
-            gcode += "; parking for temperature change\n";
+            double park_z = layer_z + 2.0;
+            gcode += gcodegen.writer().travel_to_z(park_z, "park z-hop for temp change");
         }
 
-        gcode += gcodegen.writer().set_temperature(injection_temp, true); // M109, wait
+        gcode += gcodegen.writer().set_temperature(injection_temp, true);
     }
 
-    // --- Injection ---
+    // --- Injection loop ---
     // Emit role tag for GCode processor
-    char buf[256];
     sprintf(buf, ";%s%s\n",
             GCodeProcessor::reserved_tag(GCodeProcessor::ETags::Role).c_str(),
             ExtrusionEntity::role_to_string(erMagmaInjection).c_str());
     gcode += buf;
 
-    // Force display dimensions for stationary injection extrusion.
-    // GCodeProcessor uses these instead of computing from volume/distance
-    // (which would be division by zero for E-only moves).
+    // Force display dimensions for stationary injection extrusion
     float display_width = tube_map.interior_width();
     float display_height = static_cast<float>(config.layer_height.value);
     sprintf(buf, ";%s%g\n",
@@ -181,6 +186,8 @@ std::string generate_injection_gcode(
             display_width);
     gcode += buf;
 
+    constexpr double slam_depth = 0.1;  // mm, hardcoded for safety
+
     for (const auto& pt : points) {
         double volume = pt.volume_mm3 * fill_factor;
         if (volume <= 0)
@@ -190,17 +197,19 @@ std::string generate_injection_gcode(
         Point scaled_pos(scale_(pt.position.x()), scale_(pt.position.y()));
         gcode += gcodegen.travel_to(scaled_pos, erMagmaInjection, "move to injection point");
 
-        // Unretract before stationary extrude
+        // Unretract before injection
         gcode += gcodegen.unretract();
 
-        // Calculate filament length from volume
-        double filament_length = volume / filament_area;
+        // Z-slam: lower nozzle into surface to seal against hole
+        if (z_slam) {
+            sprintf(buf, "G1 Z%.3f F600 ; z-slam seal\n", layer_z - slam_depth);
+            gcode += buf;
+        }
 
-        // Set injection feedrate
+        // Stationary extrude (E-only, no XY movement)
+        double filament_length = volume / filament_area;
         gcode += gcodegen.writer().set_speed(feedrate_mmmin);
 
-        // Stationary extrude at current position (E-only, no XY movement)
-        // Uses extrude_to_xy with current pos to maintain proper E tracking
         Vec3d cur_pos = gcodegen.writer().get_position();
         sprintf(buf, "Magma injection %.2f mm3", volume);
         gcode += gcodegen.writer().extrude_to_xy(
@@ -211,9 +220,18 @@ std::string generate_injection_gcode(
             sprintf(buf, "G4 P%d ; injection dwell\n", dwell_ms);
             gcode += buf;
         }
+
+        // Z-slam release: return to normal layer height
+        if (z_slam) {
+            sprintf(buf, "G1 Z%.3f F600 ; z-slam release\n", layer_z);
+            gcode += buf;
+        }
+
+        // Retract after injection — relieves ooze pressure, triggers wipe
+        gcode += gcodegen.retract(false, false);
     }
 
-    // Reset forced dimensions so subsequent extrusion calculates normally
+    // Reset forced dimensions
     sprintf(buf, ";%s0\n",
             GCodeProcessor::reserved_tag(GCodeProcessor::ETags::Height).c_str());
     gcode += buf;
@@ -222,10 +240,64 @@ std::string generate_injection_gcode(
     gcode += buf;
 
     // --- Ironing of tube ends ---
-    // TODO: Implement tube end ironing when magma_iron_tube_ends is enabled.
-    // Requires proper coordinate transformation through GCode's origin offset system.
-    // Will emit rectilinear ironing passes using erIroning role and user's ironing settings.
-    (void)iron_tube_ends;
+    if (iron_tube_ends) {
+        // Emit ironing role tag
+        sprintf(buf, ";%s%s\n",
+                GCodeProcessor::reserved_tag(GCodeProcessor::ETags::Role).c_str(),
+                ExtrusionEntity::role_to_string(erIroning).c_str());
+        gcode += buf;
+
+        // Ironing parameters: use user's settings if ironing is configured,
+        // otherwise use sensible defaults
+        double ir_flow_pct = 0.10;
+        double ir_spacing  = 0.1;
+        double ir_speed    = 15.0 * 60.0;  // 15 mm/s → mm/min
+
+        if (config.ironing_type.value != IroningType::NoIroning) {
+            ir_flow_pct = config.ironing_flow.value / 100.0;
+            ir_spacing  = config.ironing_spacing.value;
+            ir_speed    = config.ironing_speed.value;
+        }
+
+        float nozzle_d = config.nozzle_diameter.get_at(extruder_id);
+        double ir_height = config.layer_height.value * ir_flow_pct;
+        double ir_flow_mm3_per_mm = nozzle_d * ir_height;
+        double ir_e_per_mm = ir_flow_mm3_per_mm / filament_area;
+
+        // Iron each injection hole with serpentine parallel lines
+        for (const auto& pt : points) {
+            double radius = tube_map.interior_width() / 2.0 - nozzle_d / 2.0;
+            if (radius <= 0.05)
+                continue;
+
+            bool left_to_right = true;
+            for (double dy = -radius; dy <= radius + 0.001; dy += ir_spacing) {
+                double r2 = radius * radius - dy * dy;
+                if (r2 <= 0)
+                    continue;
+                double half_chord = std::sqrt(r2);
+
+                double x0 = pt.position.x() + (left_to_right ? -half_chord : half_chord);
+                double x1 = pt.position.x() + (left_to_right ? half_chord : -half_chord);
+                double y  = pt.position.y() + dy;
+
+                // Travel to line start
+                Point start_s(scale_(x0), scale_(y));
+                gcode += gcodegen.travel_to(start_s, erIroning, "iron start");
+                gcode += gcodegen.unretract();
+
+                // Extrude ironing line
+                double line_len = 2.0 * half_chord;
+                double e_val = line_len * ir_e_per_mm;
+                gcode += gcodegen.writer().set_speed(ir_speed);
+                gcode += gcodegen.writer().extrude_to_xy(
+                    Vec2d(x1, y), e_val, "tube iron");
+
+                left_to_right = !left_to_right;
+            }
+            gcode += gcodegen.retract(false, false);
+        }
+    }
 
     // --- Cool down ---
     if (temp_changed) {
@@ -233,10 +305,17 @@ std::string generate_injection_gcode(
         gcode += gcodegen.retract(false, false);
 
         if (park_enabled) {
-            gcode += "; parking for temperature restore\n";
+            double park_z = layer_z + 2.0;
+            gcode += gcodegen.writer().travel_to_z(park_z, "park z-hop for temp restore");
         }
 
-        gcode += gcodegen.writer().set_temperature(print_temp, true); // M109, wait
+        gcode += gcodegen.writer().set_temperature(print_temp, true);
+    }
+
+    // --- Switch back to original filament ---
+    if (need_filament_switch) {
+        gcode += "; Magma injection: restoring print filament\n";
+        gcode += gcodegen.set_extruder(original_filament, layer_z);
     }
 
     return gcode;

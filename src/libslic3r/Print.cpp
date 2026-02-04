@@ -493,6 +493,12 @@ std::vector<unsigned int> Print::support_material_extruders() const
                 extruders.emplace_back((i >= num_extruders) ? 0 : i);
             }
         }
+
+        // Magma injection filament
+        if (object->config().magma_injection_filament.value > 0) {
+            unsigned int i = (unsigned int)object->config().magma_injection_filament.value - 1;
+            extruders.emplace_back((i >= num_extruders) ? 0 : i);
+        }
     }
 
     if (support_uses_current_extruder)
@@ -1107,6 +1113,12 @@ StringObjectException Print::check_multi_filament_valid(const Print& print)
                 assert(print_object->config().support_interface_filament >= 0);
                 if (print_object->config().support_interface_filament >= 1 && (unsigned int)print_object->config().support_interface_filament < num_extruders + 1)
                     obj_used_extruder_ids.insert((unsigned int) print_object->config().support_interface_filament - 1);
+            }
+            // Magma injection filament
+            {
+                auto num_ext = (unsigned int)print_config.filament_diameter.size();
+                if (print_object->config().magma_injection_filament.value >= 1 && (unsigned int)print_object->config().magma_injection_filament.value < num_ext + 1)
+                    obj_used_extruder_ids.insert((unsigned int) print_object->config().magma_injection_filament.value - 1);
             }
             std::vector<std::string> filament_types;
             filament_types.reserve(obj_used_extruder_ids.size());
