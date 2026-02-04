@@ -285,8 +285,16 @@ set(lisbslic3r_sources
     Line.hpp
     LocalesUtils.cpp
     LocalesUtils.hpp
-    Magma/MagmaInterior.cpp
-    Magma/MagmaInterior.hpp
+    ZoneBoundary/ZoneInterior.cpp
+    ZoneBoundary/ZoneInterior.hpp
+    Magma/MagmaTriangleCell.cpp
+    Magma/MagmaTriangleCell.hpp
+    Magma/MagmaSpiralOffset.cpp
+    Magma/MagmaSpiralOffset.hpp
+    Magma/MagmaTubeMap.cpp
+    Magma/MagmaTubeMap.hpp
+    Magma/MagmaInjection.cpp
+    Magma/MagmaInjection.hpp
     MarchingSquares.hpp
     Measure.cpp
     Measure.hpp

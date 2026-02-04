@@ -1,5 +1,5 @@
-#ifndef slic3r_Magma_MagmaInterior_hpp_
-#define slic3r_Magma_MagmaInterior_hpp_
+#ifndef slic3r_ZoneBoundary_ZoneInterior_hpp_
+#define slic3r_ZoneBoundary_ZoneInterior_hpp_
 
 #include <string>
 #include <libslic3r/SLA/Interior.hpp>
@@ -8,7 +8,7 @@ namespace Slic3r {
 
 class TriangleMesh;
 
-namespace magma {
+namespace zone_boundary {
 
 // Regenerate mesh from grid. Call this after filter_thin_interior() if you need
 // to capture the mesh state before smoothing.
@@ -20,7 +20,7 @@ void regenerate_mesh_from_grid(sla::Interior &interior);
 // iterations: number of smoothing iterations (default 5)
 void smooth_interior(sla::Interior &interior, const TriangleMesh &original_mesh, int iterations = 5);
 
-// Filter out thin yolk sections using morphological reconstruction.
+// Filter out thin inner zone sections using morphological reconstruction.
 // Removes regions where the interior is thinner than min_width in any direction.
 // This eliminates small disconnected islands and thin protrusions that would
 // create unusable infill zones.
@@ -35,7 +35,7 @@ void filter_thin_interior(sla::Interior &interior, double min_width);
 // Returns true if export was successful, false if mesh is empty or export failed.
 bool debug_export_interior(const sla::Interior &interior, const std::string &stage_name, int object_id = 0);
 
-} // namespace magma
+} // namespace zone_boundary
 } // namespace Slic3r
 
-#endif // slic3r_Magma_MagmaInterior_hpp_
+#endif // slic3r_ZoneBoundary_ZoneInterior_hpp_

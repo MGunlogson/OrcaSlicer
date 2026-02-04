@@ -873,12 +873,32 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, co
         toggle_line(el, have_arachne);
     toggle_field("detect_thin_wall", !have_arachne);
 
-    // Magma infill settings
-    bool have_magma = config->opt_bool("magma_inner_shell_enabled");
-    for (auto el : { "magma_pattern", "magma_outer_infill_width", "magma_inner_shell_line_count",
-        "magma_inner_shell_line_width", "magma_min_yolk_width",
-        "magma_shell_solid_layers", "magma_shell_solid_thickness" })
-        toggle_line(el, have_magma);
+    // Dual infill zones settings
+    bool have_dual_infill = config->opt_bool("dual_infill_enabled");
+    for (auto el : { "dual_infill_outer_width", "dual_infill_shell_walls",
+        "dual_infill_shell_width", "dual_infill_min_inner_width",
+        "dual_infill_solid_layers", "dual_infill_solid_thickness" })
+        toggle_line(el, have_dual_infill);
+
+    // Magma settings — visible when Magma Triangle pattern is selected or dual infill is enabled
+    // (dual infill uses Magma Triangle pattern in outer zone regardless of sparse_infill_pattern)
+    bool is_magma_infill = config->opt_enum<InfillPattern>("sparse_infill_pattern") == ipMagmaTriangle;
+    bool have_magma_pattern = is_magma_infill || have_dual_infill;
+
+    // Magma Pattern section
+    for (auto el : { "magma_spiral_interlock", "magma_interior_width" })
+        toggle_line(el, have_magma_pattern);
+
+    // Magma Tubes section
+    for (auto el : { "magma_window_height", "magma_tube_height_layers",
+        "magma_tube_height", "magma_stagger_levels", "magma_fill_depth_factor",
+        "magma_tube_fill_factor" })
+        toggle_line(el, have_magma_pattern);
+
+    // Magma Injection section
+    for (auto el : { "magma_injection_temp", "magma_injection_speed", "magma_iron_tube_ends",
+        "magma_injection_park", "magma_injection_dwell" })
+        toggle_line(el, have_magma_pattern);
 
     // Orca
     auto is_role_based_wipe_speed = config->opt_bool("role_based_wipe_speed");

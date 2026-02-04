@@ -84,10 +84,10 @@ public:
     //BBS
     ExPolygons                  *fill_no_overlap;
 
-    // Magma: Pre-computed zone boundary from 3D shell
-    const ExPolygons            *magma_zone_boundary = nullptr;
-    // Magma: Output for yolk (interior) region inside Magma shells
-    ExPolygons                  *magma_yolk_out = nullptr;
+    // Zone: Pre-computed zone boundary from 3D shell
+    const ExPolygons            *zone_boundary = nullptr;
+    // Zone: Output for inner zone region inside boundary shells
+    ExPolygons                  *inner_zone_out = nullptr;
 
     //BBS
     Flow                        smaller_ext_perimeter_flow;

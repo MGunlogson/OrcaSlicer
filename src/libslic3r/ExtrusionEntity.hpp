@@ -37,14 +37,16 @@ enum ExtrusionRole : uint8_t {
     erSupportTransition,
     erWipeTower,
     erCustom,
-    // Magma solid infill for vertical reinforcement
-    erMagmaInfill,
-    // Magma inner shell walls (perimeters between outer and inner zones)
-    erMagmaShell,
-    // Magma floor (bottom of shell zone, solid)
-    erMagmaFloor,
-    // Magma ceiling (top of shell zone, bridges over yolk)
-    erMagmaCeiling,
+    // Dual infill zone outer infill (Magma Triangle U-tube pattern)
+    erZoneOuterInfill,
+    // Zone shell walls (perimeters between outer and inner zones)
+    erZoneShell,
+    // Zone floor (bottom of zone boundary, solid)
+    erZoneFloor,
+    // Zone ceiling (top of zone boundary, bridges over inner zone)
+    erZoneCeiling,
+    // Magma injection (stationary extrude to fill tubes with plastic)
+    erMagmaInjection,
     // Extrusion role for a collection with multiple extrusion roles.
     erMixed,
     erCount
@@ -87,10 +89,10 @@ inline bool is_infill(ExtrusionRole role)
         || role == erTopSolidInfill
         || role == erBottomSurface
         || role == erIroning
-        || role == erMagmaInfill
-        || role == erMagmaShell
-        || role == erMagmaFloor
-        || role == erMagmaCeiling;
+        || role == erZoneOuterInfill
+        || role == erZoneShell
+        || role == erZoneFloor
+        || role == erZoneCeiling;
 }
 
 inline bool is_top_surface(ExtrusionRole role)
@@ -100,24 +102,25 @@ inline bool is_top_surface(ExtrusionRole role)
 
 inline bool is_solid_infill(ExtrusionRole role)
 {
-    // All Magma roles are solid:
-    // - erMagmaInfill: U-tubes become solid after injection before next layer
-    // - erMagmaShell, erMagmaFloor, erMagmaCeiling: solid fill surfaces
+    // All zone roles are solid:
+    // - erZoneOuterInfill: U-tubes become solid after injection before next layer
+    // - erZoneShell, erZoneFloor, erZoneCeiling: solid fill surfaces
     return role == erBridgeInfill
         || role == erInternalBridgeInfill
         || role == erSolidInfill
         || role == erTopSolidInfill
         || role == erBottomSurface
         || role == erIroning
-        || role == erMagmaInfill
-        || role == erMagmaShell
-        || role == erMagmaFloor
-        || role == erMagmaCeiling;
+        || role == erZoneOuterInfill
+        || role == erZoneShell
+        || role == erZoneFloor
+        || role == erZoneCeiling;
 }
 
-inline bool is_magma(ExtrusionRole role)
+inline bool is_zone(ExtrusionRole role)
 {
-    return role == erMagmaInfill || role == erMagmaShell || role == erMagmaFloor || role == erMagmaCeiling;
+    return role == erZoneOuterInfill || role == erZoneShell || role == erZoneFloor || role == erZoneCeiling
+        || role == erMagmaInjection;
 }
 
 inline bool is_bridge(ExtrusionRole role) {

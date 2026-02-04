@@ -18,6 +18,7 @@
 #include "Utils.hpp"
 #include "Fill/FillAdaptive.hpp"
 #include "Fill/FillLightning.hpp"
+#include "Magma/MagmaTubeMap.hpp"
 #include "Format/STL.hpp"
 #include "format.hpp"
 #include "AABBTreeLines.hpp"
@@ -635,7 +636,7 @@ void PrintObject::prepare_infill()
 
     // the following step needs to be done before combination because it may need
     // to remove only half of the combined infill
-    // NOTE: This will detect our Magma stInternalSolid surfaces that need bridging
+    // NOTE: This will detect our zone stInternalSolid surfaces that need bridging
     this->bridge_over_infill();
     m_print->throw_if_canceled();
 
@@ -670,13 +671,33 @@ void PrintObject::infill()
         const auto& adaptive_fill_octree = this->m_adaptive_fill_octrees.first;
         const auto& support_fill_octree = this->m_adaptive_fill_octrees.second;
 
+        // Build Magma tube map if any region uses Magma infill
+        // Two modes: zones enabled (stZoneOuter) OR Magma as sparse pattern (stInternal)
+        {
+            const PrintRegionConfig *magma_cfg = nullptr;
+            for (size_t region_id = 0; region_id < this->num_printing_regions(); ++region_id) {
+                const PrintRegion &region = this->printing_region(region_id);
+                if (region.config().dual_infill_enabled.value ||
+                    region.config().sparse_infill_pattern.value == ipMagmaTriangle)
+                { magma_cfg = &region.config(); break; }
+            }
+
+            if (magma_cfg && !m_layers.empty()) {
+                m_print->set_status(36, L("Building Magma tube map"));
+                m_magma_tube_map = magma::MagmaTubeMap::build(
+                    m_layers, *magma_cfg, m_print->config(), this->config());
+            }
+        }
+
         BOOST_LOG_TRIVIAL(debug) << "Filling layers in parallel - start";
         tbb::parallel_for(
             tbb::blocked_range<size_t>(0, m_layers.size()),
             [this, &adaptive_fill_octree = adaptive_fill_octree, &support_fill_octree = support_fill_octree](const tbb::blocked_range<size_t>& range) {
                 for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++ layer_idx) {
                     m_print->throw_if_canceled();
-                    m_layers[layer_idx]->make_fills(adaptive_fill_octree.get(), support_fill_octree.get(), this->m_lightning_generator.get());
+                    m_layers[layer_idx]->make_fills(adaptive_fill_octree.get(), support_fill_octree.get(),
+                                                    this->m_lightning_generator.get(),
+                                                    this->m_magma_tube_map.get());
                 }
             }
         );
@@ -1389,7 +1410,7 @@ bool PrintObject::invalidate_all_steps()
 // This function analyzes slices of a region (SurfaceCollection slices).
 // Each region slice (instance of Surface) is analyzed, whether it is supported or whether it is the top surface.
 // Helper function for detecting exposed surfaces via diff operation.
-// Used by both top/bottom detection and Magma floor/ceiling detection.
+// Used by both top/bottom detection and zone floor/ceiling detection.
 // Returns areas of 'current' that are not covered by 'adjacent'.
 static ExPolygons compute_exposed_area(
     const ExPolygons& current,
@@ -1405,13 +1426,13 @@ static ExPolygons compute_exposed_area(
 // Helper function for resolving overlap between two surface types (e.g., top/bottom or floor/ceiling).
 // When surfaces overlap (thin membrane scenario), winner_surfaces gets priority.
 // Small cracks are handled specially - they stay with the surface they're part of.
-// Used by both top/bottom detection (bottom wins) and Magma floor/ceiling (ceiling wins).
+// Used by both top/bottom detection (bottom wins) and zone floor/ceiling (ceiling wins).
 static void resolve_surface_overlap(
-    Surfaces& loser_surfaces,      // top (for top/bottom) or floor (for Magma) - loses overlap
-    Surfaces& winner_surfaces,     // bottom (for top/bottom) or ceiling (for Magma) - wins overlap
+    Surfaces& loser_surfaces,      // top (for top/bottom) or floor (for zone) - loses overlap
+    Surfaces& winner_surfaces,     // bottom (for top/bottom) or ceiling (for zone) - wins overlap
     float small_crack_threshold,   // typically -flow.scaled_width() * 1.5
     bool has_adjacent_layer,       // false for first/last layer (skip small crack logic)
-    SurfaceType loser_type)        // stTop or stMagmaFloor - type for recreated loser surfaces
+    SurfaceType loser_type)        // stTop or stZoneFloor - type for recreated loser surfaces
 {
     if (loser_surfaces.empty() || winner_surfaces.empty())
         return;
@@ -1583,13 +1604,13 @@ void PrintObject::detect_surfaces_type()
 
                     // Handle overlapping top/bottom surfaces (thin membrane scenario).
                     // Bottom wins overlap to allow for proper bridge detection.
-                    // Uses shared helper that's also used for Magma floor/ceiling.
+                    // Uses shared helper that's also used for zone floor/ceiling.
                     {
                         const float small_crack_threshold = -layerm->flow(frExternalPerimeter).scaled_width() * 1.5;
                         resolve_surface_overlap(top, bottom, small_crack_threshold, lower_layer != nullptr, stTop);
                     }
 
-                    // Magma floor/ceiling detection - uses same diff pattern as top/bottom.
+                    // zone floor/ceiling detection - uses same diff pattern as top/bottom.
                     // Floor = yolk exposed from below (bottom of shell cavity)
                     // Ceiling = yolk exposed from above (top of shell cavity)
                     //
@@ -1597,53 +1618,53 @@ void PrintObject::detect_surfaces_type()
                     // using zone_boundary. The surfaces later get clipped to fill_expolygons in
                     // slices_to_fill_surfaces_clipped(), which naturally aligns them to the actual
                     // infill area computed by PerimeterGenerator. No approximations needed.
-                    Surfaces magma_floor;
-                    Surfaces magma_ceiling;
+                    Surfaces zone_floor;
+                    Surfaces zone_ceiling;
                     const PrintRegionConfig& region_config = layerm->region().config();
-                    if (region_config.magma_inner_shell_enabled && !layer->magma_zone_boundary.empty()) {
+                    if (region_config.dual_infill_enabled && !layer->zone_boundary.empty()) {
                         // Inner zone (yolk) = area inside zone_boundary
                         // This is detected on full slices; clipping to infill area happens later
-                        ExPolygons current_inner = intersection_ex(layerm_slices_surfaces, layer->magma_zone_boundary);
+                        ExPolygons current_inner = intersection_ex(layerm_slices_surfaces, layer->zone_boundary);
 
                         // Get adjacent zones using same geometric approach
                         ExPolygons lower_inner;
                         ExPolygons upper_inner;
 
-                        if (lower_layer && !lower_layer->magma_zone_boundary.empty()) {
-                            // Lower layer has Magma zone - compute its yolk
+                        if (lower_layer && !lower_layer->zone_boundary.empty()) {
+                            // Lower layer has dual infill zone - compute its yolk
                             ExPolygons lower_region_slices = interface_shells ?
                                 to_expolygons(lower_layer->m_regions[region_id]->slices.surfaces) :
                                 lower_layer->lslices;
-                            lower_inner = intersection_ex(lower_region_slices, lower_layer->magma_zone_boundary);
+                            lower_inner = intersection_ex(lower_region_slices, lower_layer->zone_boundary);
                         }
 
-                        if (upper_layer && !upper_layer->magma_zone_boundary.empty()) {
-                            // Upper layer has Magma zone - compute its yolk
+                        if (upper_layer && !upper_layer->zone_boundary.empty()) {
+                            // Upper layer has dual infill zone - compute its yolk
                             ExPolygons upper_region_slices = interface_shells ?
                                 to_expolygons(upper_layer->m_regions[region_id]->slices.surfaces) :
                                 upper_layer->lslices;
-                            upper_inner = intersection_ex(upper_region_slices, upper_layer->magma_zone_boundary);
+                            upper_inner = intersection_ex(upper_region_slices, upper_layer->zone_boundary);
                         }
 
-                        // Magma floor = yolk exposed from below (bottom of shell cavity, where yolk first appears)
+                        // Zone floor = inner zone exposed from below (bottom of shell cavity, where yolk first appears)
                         // Floor is detected in the inner zone (yolk) to close off the bottom of the cavity.
                         if (!current_inner.empty()) {
                             ExPolygons floor_ex = compute_exposed_area(current_inner, lower_inner, offset);
-                            surfaces_append(magma_floor, std::move(floor_ex), stMagmaFloor);
+                            surfaces_append(zone_floor, std::move(floor_ex), stZoneFloor);
                         }
 
-                        // Magma ceiling = yolk exposed from above (top of shell cavity, where yolk ends)
+                        // Zone ceiling = inner zone exposed from above (top of shell cavity, where yolk ends)
                         if (!current_inner.empty()) {
                             ExPolygons ceiling_ex = compute_exposed_area(current_inner, upper_inner, offset);
-                            surfaces_append(magma_ceiling, std::move(ceiling_ex), stMagmaCeiling);
+                            surfaces_append(zone_ceiling, std::move(ceiling_ex), stZoneCeiling);
                         }
 
                         // Handle overlapping floor/ceiling (thin horizontal membrane scenario).
                         // Ceiling wins overlap for proper bridging over sparse yolk.
-                        if (!magma_floor.empty() && !magma_ceiling.empty()) {
+                        if (!zone_floor.empty() && !zone_ceiling.empty()) {
                             const float small_crack_threshold = -layerm->flow(frExternalPerimeter).scaled_width() * 1.5;
-                            resolve_surface_overlap(magma_floor, magma_ceiling, small_crack_threshold,
-                                                   lower_layer != nullptr, stMagmaFloor);
+                            resolve_surface_overlap(zone_floor, zone_ceiling, small_crack_threshold,
+                                                   lower_layer != nullptr, stZoneFloor);
                         }
 
                         // NOTE: We do NOT subtract floor/ceiling from bottom/top here.
@@ -1678,20 +1699,20 @@ void PrintObject::detect_surfaces_type()
                     {
                         Polygons classified = to_polygons(top);
                         polygons_append(classified, to_polygons(bottom));
-                        polygons_append(classified, to_polygons(magma_floor));
-                        polygons_append(classified, to_polygons(magma_ceiling));
+                        polygons_append(classified, to_polygons(zone_floor));
+                        polygons_append(classified, to_polygons(zone_ceiling));
 
                         ExPolygons remainder = diff_ex(surfaces_prev_expolys, classified);
 
-                        // Magma: Split internal into outer zone and yolk based on zone_boundary
-                        if (region_config.magma_inner_shell_enabled) {
-                            if (!layer->magma_zone_boundary.empty()) {
+                        // Zone: Split internal into outer zone and yolk based on zone_boundary
+                        if (region_config.dual_infill_enabled) {
+                            if (!layer->zone_boundary.empty()) {
                                 // Layer has zone boundary - split into outer and yolk
-                                surfaces_append(surfaces_out, diff_ex(remainder, layer->magma_zone_boundary), stMagmaOuterInfill);
-                                surfaces_append(surfaces_out, intersection_ex(remainder, layer->magma_zone_boundary), stInternal);
+                                surfaces_append(surfaces_out, diff_ex(remainder, layer->zone_boundary), stZoneOuter);
+                                surfaces_append(surfaces_out, intersection_ex(remainder, layer->zone_boundary), stInternal);
                             } else {
                                 // No zone boundary on this layer - all internal becomes magma outer
-                                surfaces_append(surfaces_out, remainder, stMagmaOuterInfill);
+                                surfaces_append(surfaces_out, remainder, stZoneOuter);
                             }
                         } else {
                             surfaces_append(surfaces_out, remainder, stInternal);
@@ -1700,8 +1721,8 @@ void PrintObject::detect_surfaces_type()
 
                     surfaces_append(surfaces_out, std::move(top));
                     surfaces_append(surfaces_out, std::move(bottom));
-                    surfaces_append(surfaces_out, std::move(magma_floor));
-                    surfaces_append(surfaces_out, std::move(magma_ceiling));
+                    surfaces_append(surfaces_out, std::move(zone_floor));
+                    surfaces_append(surfaces_out, std::move(zone_ceiling));
 
         //            Slic3r::debugf "  layer %d has %d bottom, %d top and %d internal surfaces\n",
         //                $layerm->layer->id, scalar(@bottom), scalar(@top), scalar(@internal) if $Slic3r::debug;
@@ -1942,7 +1963,7 @@ void PrintObject::discover_vertical_shells()
 
     BOOST_LOG_TRIVIAL(info) << "Discovering vertical shells..." << log_memory_info();
 
-    // ShellTypeConfig: Generic configuration for shell surface types (top, bottom, magma_floor, magma_ceiling).
+    // ShellTypeConfig: Generic configuration for shell surface types (top, bottom, zone_floor, zone_ceiling).
     // This allows the collection and projection logic to be written once and applied to all shell types.
     struct ShellTypeConfig {
         const char* name;
@@ -1964,13 +1985,13 @@ void PrintObject::discover_vertical_shells()
           [](const PrintRegionConfig& c) -> int { return c.bottom_shell_layers.value; },
           [](const PrintRegionConfig& c) -> coordf_t { return c.bottom_shell_thickness.value; },
           1 },
-        { "magma_floor", {stMagmaFloor}, true,
-          [](const PrintRegionConfig& c) -> int { return c.magma_inner_shell_enabled.value ? c.magma_shell_solid_layers.value : 0; },
-          [](const PrintRegionConfig& c) -> coordf_t { return c.magma_inner_shell_enabled.value ? c.magma_shell_solid_thickness.value : 0; },
+        { "zone_floor", {stZoneFloor}, true,
+          [](const PrintRegionConfig& c) -> int { return c.dual_infill_enabled.value ? c.dual_infill_solid_layers.value : 0; },
+          [](const PrintRegionConfig& c) -> coordf_t { return c.dual_infill_enabled.value ? c.dual_infill_solid_thickness.value : 0; },
           2 },
-        { "magma_ceiling", {stMagmaCeiling}, false,
-          [](const PrintRegionConfig& c) -> int { return c.magma_inner_shell_enabled.value ? c.magma_shell_solid_layers.value : 0; },
-          [](const PrintRegionConfig& c) -> coordf_t { return c.magma_inner_shell_enabled.value ? c.magma_shell_solid_thickness.value : 0; },
+        { "zone_ceiling", {stZoneCeiling}, false,
+          [](const PrintRegionConfig& c) -> int { return c.dual_infill_enabled.value ? c.dual_infill_solid_layers.value : 0; },
+          [](const PrintRegionConfig& c) -> coordf_t { return c.dual_infill_enabled.value ? c.dual_infill_solid_thickness.value : 0; },
           3 },
     };
 
@@ -2179,7 +2200,7 @@ void PrintObject::discover_vertical_shells()
                     };
                     static constexpr const bool one_more_layer_below_top_bottom_surfaces = false;
 
-                    // Generic shell projection loop - handles all shell types (top, bottom, magma_floor, magma_ceiling)
+                    // Generic shell projection loop - handles all shell types (top, bottom, zone_floor, zone_ceiling)
                     for (const auto& config : shell_type_configs) {
                         int n_layers = config.get_layer_count(region_config);
                         if (n_layers <= 0)
@@ -2190,7 +2211,7 @@ void PrintObject::discover_vertical_shells()
                         bool use_thickness = (thickness > 0 && config.cache_index < 2);
 
                         if (config.propagate_upward) {
-                            // Look at layers BELOW, propagate UP (bottom, magma_floor)
+                            // Look at layers BELOW, propagate UP (bottom, zone_floor)
                             coordf_t z_ref = layer->bottom_z();
                             int i = int(idx_layer) - 1;
                             int i_limit = int(idx_layer) - n_layers;
@@ -2216,7 +2237,7 @@ void PrintObject::discover_vertical_shells()
                                 if (i >= 0 && (i > i_limit || (use_thickness && z_ref - m_layers[i]->print_z < thickness - EPSILON)))
                                     combine_holes(cache_top_botom_regions[i].holes);
                         } else {
-                            // Look at layers ABOVE, propagate DOWN (top, magma_ceiling)
+                            // Look at layers ABOVE, propagate DOWN (top, zone_ceiling)
                             coordf_t z_ref = layer->print_z;
                             int i = int(idx_layer) + 1;
                             int i_limit = int(idx_layer) + n_layers;
@@ -2299,9 +2320,9 @@ void PrintObject::discover_vertical_shells()
 #endif /* SLIC3R_DEBUG_SLICE_PROCESSING */
 
                     // Trim the shells region by the internal & internal void surfaces.
-                    // Magma: Include stMagmaOuterInfill so shells can expand into Magma outer zone.
-                    // Users who want Magma right after first layer can set top/bottom layers to 1.
-                    const Polygons polygonsInternal = to_polygons(layerm->fill_surfaces.filter_by_types({ stInternal, stInternalVoid, stInternalSolid, stMagmaOuterInfill }));
+                    // Zone: Include stZoneOuter so shells can expand into outer zone.
+                    // Users who want zone infill right after first layer can set top/bottom layers to 1.
+                    const Polygons polygonsInternal = to_polygons(layerm->fill_surfaces.filter_by_types({ stInternal, stInternalVoid, stInternalSolid, stZoneOuter }));
                     shell = intersection(shell, polygonsInternal, ApplySafetyOffset::Yes);
                     polygons_append(shell, diff(polygonsInternal, holes));
                     if (shell.empty())
@@ -2385,8 +2406,8 @@ void PrintObject::discover_vertical_shells()
                     // Trim the internal & internalvoid by the shell.
                     Slic3r::ExPolygons new_internal = diff_ex(layerm->fill_surfaces.filter_by_type(stInternal), regularized_shell);
                     Slic3r::ExPolygons new_internal_void = diff_ex(layerm->fill_surfaces.filter_by_type(stInternalVoid), regularized_shell);
-                    // Magma: Also trim the outer infill zone by the shell
-                    Slic3r::ExPolygons new_magma_outer = diff_ex(layerm->fill_surfaces.filter_by_type(stMagmaOuterInfill), regularized_shell);
+                    // Zone: Also trim the outer infill zone by the shell
+                    Slic3r::ExPolygons new_zone_outer = diff_ex(layerm->fill_surfaces.filter_by_type(stZoneOuter), regularized_shell);
 
 #ifdef SLIC3R_DEBUG_SLICE_PROCESSING
                     {
@@ -2397,13 +2418,13 @@ void PrintObject::discover_vertical_shells()
 #endif /* SLIC3R_DEBUG_SLICE_PROCESSING */
 
                     // Assign resulting internal surfaces to layer.
-                    // Keep boundary types: stTop, stBottom, stBottomBridge, and Magma boundaries
-                    layerm->fill_surfaces.keep_types({ stTop, stBottom, stBottomBridge, stMagmaFloor, stMagmaCeiling });
+                    // Keep boundary types: stTop, stBottom, stBottomBridge, and zone boundaries
+                    layerm->fill_surfaces.keep_types({ stTop, stBottom, stBottomBridge, stZoneFloor, stZoneCeiling });
                     layerm->fill_surfaces.append(new_internal,       stInternal);
                     layerm->fill_surfaces.append(new_internal_void,  stInternalVoid);
                     layerm->fill_surfaces.append(new_internal_solid, stInternalSolid);
-                    // Magma: Re-add the trimmed outer infill zone
-                    layerm->fill_surfaces.append(new_magma_outer,    stMagmaOuterInfill);
+                    // Zone: Re-add the trimmed outer infill zone
+                    layerm->fill_surfaces.append(new_zone_outer,    stZoneOuter);
                 } // for each layer
             });
         m_print->throw_if_canceled();
@@ -2493,10 +2514,13 @@ void PrintObject::bridge_over_infill()
                     unsupported_area.insert(unsupported_area.end(), fill_polys.begin(), fill_polys.end());
                     for (const Surface &surface : region->fill_surfaces) {
                         // Collect solid surfaces - anything that provides support
-                        // Magma: stMagmaOuterInfill is SOLID (dense honeycomb filled with injected plastic)
-                        // so it provides support and should NOT be treated as sparse
+                        // Zone: stZoneOuter is SOLID (dense honeycomb filled with injected plastic)
+                        // so it provides support and should NOT be treated as sparse.
+                        // Magma Triangle infill is also solid after injection — treat same as 100% density.
                         bool is_sparse = (surface.surface_type == stInternal);
-                        if (!is_sparse || region->region().config().sparse_infill_density.value == 100) {
+                        bool is_effectively_solid = region->region().config().sparse_infill_density.value == 100
+                            || region->region().config().sparse_infill_pattern.value == ipMagmaTriangle;
+                        if (!is_sparse || is_effectively_solid) {
                             Polygons p = to_polygons(surface.expolygon);
                             lower_layer_solids.insert(lower_layer_solids.end(), p.begin(), p.end());
                         }
@@ -2519,8 +2543,8 @@ void PrintObject::bridge_over_infill()
                 unsupported_area   = diff(unsupported_area, lower_layer_solids);
                 
                 for (const LayerRegion *region : layer->regions()) {
-                    // Include stMagmaCeiling for bridging - ceiling over sparse yolk needs bridge flow
-                    SurfacesPtr region_internal_solids = region->fill_surfaces.filter_by_types({stInternalSolid, stMagmaCeiling});
+                    // Include stZoneCeiling for bridging - ceiling over sparse yolk needs bridge flow
+                    SurfacesPtr region_internal_solids = region->fill_surfaces.filter_by_types({stInternalSolid, stZoneCeiling});
                     for (const Surface *s : region_internal_solids) {
                         Polygons unsupported         = intersection(to_polygons(s->expolygon), unsupported_area);
                         
@@ -2760,10 +2784,12 @@ void PrintObject::bridge_over_infill()
                 break;
 
             for (const LayerRegion *region : layer->regions()) {
-                bool has_low_density = region->region().config().sparse_infill_density.value < 100;
+                bool has_low_density = region->region().config().sparse_infill_density.value < 100
+                    && region->region().config().sparse_infill_pattern.value != ipMagmaTriangle;
                 for (const Surface &surface : region->fill_surfaces) {
-                    // Magma: stMagmaOuterInfill is SOLID (dense honeycomb filled with injected plastic)
-                    // so it should NOT be treated as sparse - bridges should not span over it
+                    // Zone: stZoneOuter is SOLID (dense honeycomb filled with injected plastic)
+                    // so it should NOT be treated as sparse - bridges should not span over it.
+                    // Magma Triangle is also solid after injection.
                     bool is_sparse = (surface.surface_type == stInternal && has_low_density) ||
                                      surface.surface_type == stInternalVoid;
                     if (is_sparse) {
@@ -3121,8 +3147,8 @@ void PrintObject::bridge_over_infill()
                 for (const LayerRegion *region : layer->regions()) {
                     Polygons top_polys = to_polygons(region->fill_surfaces.filter_by_types({stTop}));
                     total_top_area.insert(total_top_area.end(), top_polys.begin(), top_polys.end());
-                    // Magma: Include stMagmaOuterInfill so top surfaces can anchor into Magma outer zones
-                    Polygons internal_polys = to_polygons(region->fill_surfaces.filter_by_types({stInternal, stInternalSolid, stMagmaOuterInfill}));
+                    // Zone: Include stZoneOuter so top surfaces can anchor into outer zones
+                    Polygons internal_polys = to_polygons(region->fill_surfaces.filter_by_types({stInternal, stInternalSolid, stZoneOuter}));
                     expansion_area.insert(expansion_area.end(), internal_polys.begin(), internal_polys.end());
                     Polygons fill_polys = to_polygons(region->fill_expolygons);
                     total_fill_area.insert(total_fill_area.end(), fill_polys.begin(), fill_polys.end());
@@ -3149,12 +3175,12 @@ void PrintObject::bridge_over_infill()
                     Polygons    area_to_be_bridge = expand(candidate.new_polys, flow.scaled_spacing());
                     area_to_be_bridge             = intersection(area_to_be_bridge, deep_infill_area);
 
-                    // Magma: Clip initial bridge area to yolk BEFORE anchor expansion.
+                    // Zone: Clip initial bridge area to yolk BEFORE anchor expansion.
                     // Bridges should only start over sparse infill (yolk). Anchor expansion
                     // will then naturally extend into surrounding shell walls for adhesion.
-                    // This prevents bridges from escaping into the dense Magma outer zone.
-                    if (!candidate.region->magma_yolk.empty()) {
-                        area_to_be_bridge = intersection(area_to_be_bridge, to_polygons(candidate.region->magma_yolk));
+                    // This prevents bridges from escaping into the dense outer zone.
+                    if (!candidate.region->inner_zone.empty()) {
+                        area_to_be_bridge = intersection(area_to_be_bridge, to_polygons(candidate.region->inner_zone));
                     }
 
                     area_to_be_bridge.erase(std::remove_if(area_to_be_bridge.begin(), area_to_be_bridge.end(),
@@ -3280,12 +3306,12 @@ void PrintObject::bridge_over_infill()
                     new_surfaces.emplace_back(stInternal, ep);
                 }
 
-                // Magma: Get stMagmaOuterInfill for processing (will compute final polygons after stInternalSolid)
-                SurfacesPtr magma_outer_infills = region->fill_surfaces.filter_by_type(stMagmaOuterInfill);
+                // Zone: Get stZoneOuter for processing (will compute final polygons after stInternalSolid)
+                SurfacesPtr zone_outer_infills = region->fill_surfaces.filter_by_type(stZoneOuter);
 
                 // Get solid surfaces that can become internal bridges
                 SurfacesPtr internal_solids = region->fill_surfaces.filter_by_type(stInternalSolid);
-                SurfacesPtr magma_ceilings = region->fill_surfaces.filter_by_type(stMagmaCeiling);
+                SurfacesPtr zone_ceilings = region->fill_surfaces.filter_by_type(stZoneCeiling);
                 if (surfaces_by_layer.find(lidx) != surfaces_by_layer.end()) {
                     for (const CandidateSurface &cs : surfaces_by_layer.at(lidx)) {
                         // Check stInternalSolid surfaces
@@ -3300,8 +3326,8 @@ void PrintObject::bridge_over_infill()
                                 break;
                             }
                         }
-                        // Check stMagmaCeiling surfaces (Magma shell ceiling over sparse yolk)
-                        for (const Surface *surface : magma_ceilings) {
+                        // Check stZoneCeiling surfaces (zone shell ceiling over sparse yolk)
+                        for (const Surface *surface : zone_ceilings) {
                             if (cs.original_surface == surface) {
                                 Surface tmp{*surface, {}};
                                 tmp.surface_type = stInternalBridge;
@@ -3319,28 +3345,28 @@ void PrintObject::bridge_over_infill()
                 ExPolygons new_internal_solids = to_expolygons(internal_solids);
                 new_internal_solids.insert(new_internal_solids.end(), additional_ensuring.begin(), additional_ensuring.end());
                 new_internal_solids = diff_ex(new_internal_solids, cut_from_infill);
-                // Magma: Allow stInternalSolid to expand into stMagmaOuterInfill so shells
-                // can properly expand into Magma outer zone. Users who want Magma right after
+                // Zone: Allow stInternalSolid to expand into stZoneOuter so shells
+                // can properly expand into outer zone. Users who want Magma right after
                 // first layer can set top/bottom layers to 1.
                 new_internal_solids = union_safety_offset_ex(new_internal_solids);
                 for (const ExPolygon &ep : new_internal_solids) {
                     new_surfaces.emplace_back(stInternalSolid, ep);
                 }
 
-                // Magma: Handle stMagmaOuterInfill - subtract bridge areas AND stInternalSolid
-                // (shells that expanded into Magma outer become stInternalSolid, remainder stays stMagmaOuterInfill)
-                ExPolygons new_magma_outer_infills = diff_ex(magma_outer_infills, cut_from_infill);
-                new_magma_outer_infills = diff_ex(new_magma_outer_infills, new_internal_solids);
-                for (const ExPolygon &ep : new_magma_outer_infills) {
-                    new_surfaces.emplace_back(stMagmaOuterInfill, ep);
+                // Zone: Handle stZoneOuter - subtract bridge areas AND stInternalSolid
+                // (shells that expanded into outer zone become stInternalSolid, remainder stays stZoneOuter)
+                ExPolygons new_zone_outer_infills = diff_ex(zone_outer_infills, cut_from_infill);
+                new_zone_outer_infills = diff_ex(new_zone_outer_infills, new_internal_solids);
+                for (const ExPolygon &ep : new_zone_outer_infills) {
+                    new_surfaces.emplace_back(stZoneOuter, ep);
                 }
 
-                // Handle stMagmaCeiling remnants (parallel pattern for Magma)
-                ExPolygons new_magma_ceilings = to_expolygons(magma_ceilings);
-                new_magma_ceilings = diff_ex(new_magma_ceilings, cut_from_infill);
-                new_magma_ceilings = union_safety_offset_ex(new_magma_ceilings);
-                for (const ExPolygon &ep : new_magma_ceilings) {
-                    new_surfaces.emplace_back(stMagmaCeiling, ep);
+                // Handle stZoneCeiling remnants (parallel pattern for zone)
+                ExPolygons new_zone_ceilings = to_expolygons(zone_ceilings);
+                new_zone_ceilings = diff_ex(new_zone_ceilings, cut_from_infill);
+                new_zone_ceilings = union_safety_offset_ex(new_zone_ceilings);
+                for (const ExPolygon &ep : new_zone_ceilings) {
+                    new_surfaces.emplace_back(stZoneCeiling, ep);
                 }
 
 #ifdef DEBUG_BRIDGE_OVER_INFILL
@@ -3352,8 +3378,8 @@ void PrintObject::bridge_over_infill()
                            to_polylines(to_polygons(new_internal_solids)));
 #endif
 
-                // Magma: Include stMagmaOuterInfill and stMagmaCeiling since we process and re-add them above
-                region->fill_surfaces.remove_types({stInternalSolid, stInternal, stMagmaOuterInfill, stMagmaCeiling});
+                // Zone: Include stZoneOuter and stZoneCeiling since we process and re-add them above
+                region->fill_surfaces.remove_types({stInternalSolid, stInternal, stZoneOuter, stZoneCeiling});
                 region->fill_surfaces.append(new_surfaces);
             }
         }
@@ -3849,19 +3875,19 @@ void PrintObject::discover_horizontal_shells()
             coordf_t print_z  = layer->print_z;
             coordf_t bottom_z = layer->bottom_z();
             // Surface types that trigger horizontal shell propagation:
-            // stTop, stBottom, stBottomBridge (existing) + stMagmaFloor, stMagmaCeiling (Magma)
+            // stTop, stBottom, stBottomBridge (existing) + stZoneFloor, stZoneCeiling (dual infill zones)
             static constexpr SurfaceType horizontal_shell_surface_types[] = {
-                stTop, stBottom, stBottomBridge, stMagmaFloor, stMagmaCeiling
+                stTop, stBottom, stBottomBridge, stZoneFloor, stZoneCeiling
             };
             for (SurfaceType type : horizontal_shell_surface_types) {
                 m_print->throw_if_canceled();
 
-                // Magma types use Magma-specific config, regular types use top/bottom shell config
-                bool is_magma = (type == stMagmaFloor || type == stMagmaCeiling);
-                if (is_magma && !region_config.magma_inner_shell_enabled)
+                // Zone types use zone-specific config, regular types use top/bottom shell config
+                bool is_zone = (type == stZoneFloor || type == stZoneCeiling);
+                if (is_zone && !region_config.dual_infill_enabled)
                     continue;
 
-                int num_solid_layers = is_magma ? region_config.magma_shell_solid_layers.value :
+                int num_solid_layers = is_zone ? region_config.dual_infill_solid_layers.value :
                                        (type == stTop) ? region_config.top_shell_layers.value :
                                        region_config.bottom_shell_layers.value;
                 if (num_solid_layers == 0)
@@ -3891,11 +3917,11 @@ void PrintObject::discover_horizontal_shells()
                     continue;
 //                Slic3r::debugf "Layer %d has %s surfaces\n", $i, ($type == stTop) ? 'top' : 'bottom';
 
-                // Scatter top / bottom / Magma floor/ceiling regions to other layers.
-                // Direction: stTop and stMagmaCeiling propagate DOWN, stBottom/stBottomBridge and stMagmaFloor propagate UP
+                // Scatter top / bottom / zone floor/ceiling regions to other layers.
+                // Direction: stTop and stZoneCeiling propagate DOWN, stBottom/stBottomBridge and stZoneFloor propagate UP
                 // Scattering process is inherently serial, it is difficult to parallelize without locking.
-                bool propagate_down = (type == stTop || type == stMagmaCeiling);
-                coordf_t solid_thickness = is_magma ? region_config.magma_shell_solid_thickness.value :
+                bool propagate_down = (type == stTop || type == stZoneCeiling);
+                coordf_t solid_thickness = is_zone ? region_config.dual_infill_solid_thickness.value :
                                            propagate_down ? region_config.top_shell_thickness.value :
                                            region_config.bottom_shell_thickness.value;
                 for (int n = propagate_down ? int(i) - 1 : int(i) + 1;
@@ -3924,18 +3950,18 @@ void PrintObject::discover_horizontal_shells()
                     {
                         Polygons internal;
                         for (const Surface &surface : neighbor_layerm->fill_surfaces.surfaces)
-                            // Magma: Include stMagmaOuterInfill so shell thickness propagates into
-                            // the outer zone. Note: stMagmaOuterInfill is excluded from too_narrow
+                            // Zone: Include stZoneOuter so shell thickness propagates into
+                            // the outer zone. Note: stZoneOuter is excluded from too_narrow
                             // expansion (below) to prevent 3x line width bleed - different purposes.
                             if (surface.surface_type == stInternal || surface.surface_type == stInternalSolid ||
-                                surface.surface_type == stMagmaOuterInfill ||
-                                surface.is_magma_boundary())
+                                surface.surface_type == stZoneOuter ||
+                                surface.is_zone_boundary())
                                 polygons_append(internal, to_polygons(surface.expolygon));
-                        // Magma: Exclude yolk from shell propagation targets. The yolk is bounded
-                        // by Magma shell walls (perimeters) and should be treated like the exterior
+                        // Zone: Exclude yolk from shell propagation targets. The yolk is bounded
+                        // by zone shell walls (perimeters) and should be treated like the exterior
                         // of the model - shell propagation stops at the shell wall boundary.
-                        if (!neighbor_layerm->magma_yolk.empty())
-                            internal = diff(internal, to_polygons(neighbor_layerm->magma_yolk));
+                        if (!neighbor_layerm->inner_zone.empty())
+                            internal = diff(internal, to_polygons(neighbor_layerm->inner_zone));
                         new_internal_solid = intersection(solid, internal, ApplySafetyOffset::Yes);
                     }
                     if (new_internal_solid.empty()) {
@@ -4005,17 +4031,17 @@ void PrintObject::discover_horizontal_shells()
                             // make sure our grown surfaces don't exceed the fill area
                             Polygons internal;
                             for (const Surface &surface : neighbor_layerm->fill_surfaces.surfaces)
-                                // Magma: Exclude stMagmaOuterInfill. It passes is_internal() but the
+                                // Zone: Exclude stZoneOuter. It passes is_internal() but the
                                 // 3x line width expansion would bleed into the dense honeycomb outer
                                 // zone, converting it to stInternalSolid. The outer zone is already
                                 // solid (filled with injected plastic) and doesn't need shell support.
-                                if (surface.is_internal() && !surface.is_bridge() && !surface.is_magma_outer())
+                                if (surface.is_internal() && !surface.is_bridge() && !surface.is_zone_outer())
                                     polygons_append(internal, to_polygons(surface.expolygon));
-                            // Magma: Exclude yolk from expansion targets. The yolk is bounded by
-                            // Magma shell walls and should be treated like the exterior - expansion
+                            // Zone: Exclude yolk from expansion targets. The yolk is bounded by
+                            // zone shell walls and should be treated like the exterior - expansion
                             // cannot cross the shell wall boundary into the yolk.
-                            if (!neighbor_layerm->magma_yolk.empty())
-                                internal = diff(internal, to_polygons(neighbor_layerm->magma_yolk));
+                            if (!neighbor_layerm->inner_zone.empty())
+                                internal = diff(internal, to_polygons(neighbor_layerm->inner_zone));
                             polygons_append(new_internal_solid,
                                 intersection(
                                     expand(too_narrow, +margin),
@@ -4042,13 +4068,13 @@ void PrintObject::discover_horizontal_shells()
                     // assign resulting internal surfaces to layer
                     neighbor_layerm->fill_surfaces.append(internal, stInternal);
                     polygons_append(polygons_internal, to_polygons(std::move(internal)));
-                    // Magma: Also handle stMagmaOuterInfill (subtract solid and re-add)
+                    // Zone: Also handle stZoneOuter (subtract solid and re-add)
                     // No ApplySafetyOffset - it causes boundary expansion issues
-                    ExPolygons magma_outer = diff_ex(backup.filter_by_type(stMagmaOuterInfill), polygons_internal);
-                    neighbor_layerm->fill_surfaces.append(magma_outer, stMagmaOuterInfill);
-                    polygons_append(polygons_internal, to_polygons(std::move(magma_outer)));
-                    // assign top, bottom, and Magma boundary surfaces to layer
-                    backup.keep_types({ stTop, stBottom, stBottomBridge, stMagmaFloor, stMagmaCeiling });
+                    ExPolygons zone_outer = diff_ex(backup.filter_by_type(stZoneOuter), polygons_internal);
+                    neighbor_layerm->fill_surfaces.append(zone_outer, stZoneOuter);
+                    polygons_append(polygons_internal, to_polygons(std::move(zone_outer)));
+                    // assign top, bottom, and zone boundary surfaces to layer
+                    backup.keep_types({ stTop, stBottom, stBottomBridge, stZoneFloor, stZoneCeiling });
                     std::vector<SurfacesPtr> top_bottom_groups;
                     backup.group(&top_bottom_groups);
                     for (SurfacesPtr &group : top_bottom_groups)

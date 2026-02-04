@@ -171,22 +171,22 @@ public:
         int  print_modify_count{-1};
         bool previewing{false};
     };
-    // Magma: Processing stages for interior shell visualization
-    enum class MagmaShellStage { Initial, Filtered, Smoothed };
-    // Magma: Cached mesh data for a single object's stages
-    struct MagmaCachedObject {
+    // Zone boundary: Processing stages for interior shell visualization
+    enum class ZoneBoundaryStage { Initial, Filtered, Smoothed };
+    // Zone boundary: Cached mesh data for a single object's stages
+    struct ZoneCachedObject {
         std::array<TriangleMesh, 3> stage_meshes;  // [Initial, Filtered, Smoothed]
         std::vector<Transform3d> instance_transforms;  // One transform per instance
         bool has_data{false};
     };
-    // Magma: helper to render interior shell boundaries for debugging
-    struct MagmaShells
+    // Zone boundary: helper to render interior shell boundaries for debugging
+    struct ZoneBoundaryShells
     {
         GLVolumeCollection volumes;
         bool visible{true};
-        MagmaShellStage stage{MagmaShellStage::Smoothed};
+        ZoneBoundaryStage stage{ZoneBoundaryStage::Smoothed};
         // Cache - valid until model changes (cleared on reset_shell)
-        std::vector<MagmaCachedObject> cached_objects;
+        std::vector<ZoneCachedObject> cached_objects;
         bool cache_valid{false};
     };
     //BBS
@@ -194,7 +194,7 @@ public:
     GCodeCheckResult  m_gcode_check_result;
     FilamentPrintableResult filament_printable_reuslt;
     Shells            m_shells;
-    MagmaShells       m_magma_shells;  // Magma interior shell debug visualization
+    ZoneBoundaryShells m_zone_shells;  // Zone interior shell debug visualization
 
 private:
     std::vector<int> m_plater_extruder;
@@ -283,14 +283,14 @@ public:
     void reset_shell();
     void load_shells(const Print& print, bool initialized, bool force_previewing = false);
     void set_shells_on_preview(bool is_previewing) { m_shells.previewing = is_previewing; }
-    // Magma: Load and render interior shell boundaries
-    void load_magma_shells(const Print& print);
-    void rebuild_magma_volumes();  // Rebuild GLVolumes from cached stage data
-    void set_magma_shells_visible(bool visible) { m_magma_shells.visible = visible; }
-    bool are_magma_shells_visible() const { return m_magma_shells.visible; }
-    void set_magma_shell_stage(MagmaShellStage stage);
-    MagmaShellStage get_magma_shell_stage() const { return m_magma_shells.stage; }
-    void cycle_magma_shell_stage();  // Cycles Initial -> Filtered -> Smoothed -> Initial
+    // Zone boundary: Load and render interior shell boundaries
+    void load_zone_shells(const Print& print);
+    void rebuild_zone_volumes();  // Rebuild GLVolumes from cached stage data
+    void set_zone_shells_visible(bool visible) { m_zone_shells.visible = visible; }
+    bool are_zone_shells_visible() const { return m_zone_shells.visible; }
+    void set_zone_boundary_stage(ZoneBoundaryStage stage);
+    ZoneBoundaryStage get_zone_boundary_stage() const { return m_zone_shells.stage; }
+    void cycle_zone_boundary_stage();  // Cycles Initial -> Filtered -> Smoothed -> Initial
     //BBS: add all plates filament statistics
     void render_all_plates_stats(const std::vector<const GCodeProcessorResult*>& gcode_result_list, bool show = true) const;
     //BBS: GUI refactor: add canvas width and height
@@ -379,7 +379,7 @@ private:
     //void load_shells(const Print& print);
     void render_toolpaths();
     void render_shells(int canvas_width, int canvas_height);
-    void render_magma_shells(int canvas_width, int canvas_height);  // Magma interior shell debug
+    void render_zone_shells(int canvas_width, int canvas_height);  // Zone interior shell debug
 
     //BBS: GUI refactor: add canvas size
     void render_legend(float &legend_height, int canvas_width, int canvas_height, int right_margin);

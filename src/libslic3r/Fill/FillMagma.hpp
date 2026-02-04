@@ -1,61 +1,56 @@
 #ifndef slic3r_FillMagma_hpp_
 #define slic3r_FillMagma_hpp_
 
-#include "FillRectilinear.hpp"
+#include "FillBase.hpp"
+#include "../Magma/MagmaTriangleCell.hpp"
 
 namespace Slic3r {
 
+namespace magma { class MagmaTubeMap; }
+
 // Magma Triangle infill pattern for vertical reinforcement
 //
-// Creates a triangle grid pattern that shifts slightly each layer to create
-// interlocking spirals. The shift is calculated to maintain ~30% overlap with
-// the same-direction lines from 3 layers below (triangle has 3-layer cycle).
+// Creates a triangle grid pattern with:
+// - Circular spiral offset per layer for helical interlocking tubes
+// - Staggered windows (gaps in shared walls) that create U-tube pairs
+// - Proper cell sizing for injection nozzle requirements
 //
-// Future enhancements:
-// - Dynamic corner width for rounder tube cross-sections
-// - Window gaps for U-tube pairing
-// - Stagger levels for Z-offset weak plane avoidance
-class FillMagmaTriangle : public FillRectilinear
+// Generates lines directly from the TriangleLattice (not via multiline engine).
+// Window gaps are built into line generation, not clipped after the fact.
+class FillMagmaTriangle : public Fill
 {
 public:
     Fill* clone() const override { return new FillMagmaTriangle(*this); }
     ~FillMagmaTriangle() override = default;
 
-    Polylines fill_surface(const Surface *surface, const FillParams &params) override;
+    // Pre-computed tube map (set by Fill.cpp, non-owning)
+    const magma::MagmaTubeMap* tube_map = nullptr;
 
     // Triangle pattern is self-crossing (3 directions intersect)
     bool is_self_crossing() override { return true; }
+
+    // Enable path sorting for travel optimization
+    bool no_sort() const override { return false; }
 
 protected:
     // Fixed angle - pattern doesn't rotate between layers
     // (spiral interlock comes from circular translation offset)
     float _layer_angle(size_t idx) const override { return 0.f; }
 
-    // Calculate circular spiral offset for this layer
-    // The pattern translates in a circle, creating helix-shaped tubes
-    // that interlock when filled with plastic.
-    // Rotation period is dynamically calculated for max spiral rate at 40% overlap.
-    // Output: (offset_x, offset_y) in mm
-    void calculate_spiral_offset(const FillParams &params, float interior_width, float &offset_x, float &offset_y) const;
+    // Use origin (0,0) as reference point. Pattern grid is aligned to
+    // world origin. Spiral offset handles layer-to-layer variation.
+    std::pair<float, Point> _infill_direction(const Surface *surface) const override;
 
-    // Project (x,y) offset onto the perpendicular of a line direction
-    // Returns the pattern_shift value for that line direction
-    float project_offset_to_shift(float offset_x, float offset_y, float line_angle) const;
-};
-
-// Magma Hex infill pattern (future)
-// Similar to triangle but uses hexagonal cells
-class FillMagmaHex : public FillRectilinear
-{
-public:
-    Fill* clone() const override { return new FillMagmaHex(*this); }
-    ~FillMagmaHex() override = default;
-
-    Polylines fill_surface(const Surface *surface, const FillParams &params) override;
-    bool is_self_crossing() override { return true; }
-
-protected:
-    float _layer_angle(size_t idx) const override { return 0.f; }
+    // Generate triangle infill for one ExPolygon region.
+    // Lines are generated directly from the TriangleLattice with window gaps
+    // built in, then clipped to the polygon via intersection_pl and anchored
+    // via chain_or_connect_infill.
+    void _fill_surface_single(
+        const FillParams &params,
+        unsigned int thickness_layers,
+        const std::pair<float, Point> &direction,
+        ExPolygon expolygon,
+        Polylines &polylines_out) override;
 };
 
 } // namespace Slic3r

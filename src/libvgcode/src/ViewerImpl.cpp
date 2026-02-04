@@ -302,11 +302,12 @@ static const std::array<Color, size_t(EGCodeExtrusionRole::COUNT)> DEFAULT_EXTRU
     {   0,  59, 110 }, // Brim
     {   0,  64,   0 }, // SupportTransition
     { 128, 128, 128 }, // Mixed
-    // Magma - unified warm volcanic palette
-    { 255,  80,  30 }, // MagmaInfill - Hot Lava (bright orange-red)
-    { 180,  70,  50 }, // MagmaShell - Ember (warm brown-red)
-    { 160,  40,  80 }, // MagmaFloor - Wine (deep magenta-red)
-    { 230, 160,  60 }, // MagmaCeiling - Amber Gold (warm amber)
+    // Dual Infill Zones - Volcanic Strata palette
+    { 255,  80,  30 }, // ZoneOuterInfill - Hot Orange (infill channels)
+    { 160,  90,  65 }, // ZoneShell - Clay (earth tone group)
+    { 130,  75,  55 }, // ZoneFloor - Dark Clay (earth tone group)
+    { 185, 110,  75 }, // ZoneCeiling - Sandstone (earth tone group)
+    { 255,  25,   0 }, // MagmaInjection - Molten Lava (brightest)
 } };
 
 static const std::array<Color, size_t(EOptionType::COUNT)> DEFAULT_OPTIONS_COLORS{ {
@@ -933,7 +934,8 @@ static void extract_pos_and_or_hwa(const std::vector<PathVertex>& vertices, floa
         const bool prev_line_valid = i > 0 && valid_lines_bitset[i - 1];
         const Vec3 prev_line = prev_line_valid ? v.position - vertices[i - 1].position : ZERO;
         const bool this_line_valid = i + 1 < vertices.size() &&
-                                     vertices[i + 1].position != v.position &&
+                                     (vertices[i + 1].position != v.position ||
+                                      v.role == EGCodeExtrusionRole::MagmaInjection) &&
                                      vertices[i + 1].type == move_type &&
                                      move_type != EMoveType::Seam;
         const Vec3 this_line = this_line_valid ? vertices[i + 1].position - v.position : ZERO;

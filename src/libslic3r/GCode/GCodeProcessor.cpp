@@ -3686,8 +3686,15 @@ void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes
         else if (delta_pos[E] < 0.0f)
             return (delta_pos[X] != 0.0f || delta_pos[Y] != 0.0f || delta_pos[Z] != 0.0f) ? EMoveType::Travel : EMoveType::Retract;
         else if (delta_pos[E] > 0.0f) {
-            if (delta_pos[X] == 0.0f && delta_pos[Y] == 0.0f)
-                return (delta_pos[Z] == 0.0f) ? EMoveType::Unretract : EMoveType::Travel;
+            if (delta_pos[X] == 0.0f && delta_pos[Y] == 0.0f) {
+                if (delta_pos[Z] == 0.0f) {
+                    // Magma injection: stationary extrude is real extrusion, not unretract
+                    if (m_extrusion_role == erMagmaInjection)
+                        return EMoveType::Extrude;
+                    return EMoveType::Unretract;
+                }
+                return EMoveType::Travel;
+            }
             else if (delta_pos[X] != 0.0f || delta_pos[Y] != 0.0f)
                 return EMoveType::Extrude;
         }
@@ -3745,7 +3752,14 @@ void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes
         const float delta_xyz = std::sqrt(sqr(delta_pos[X]) + sqr(delta_pos[Y]) + sqr(delta_pos[Z]));
         m_travel_dist = delta_xyz;
         float volume_extruded_filament = area_filament_cross_section * delta_pos[E];
-        float area_toolpath_cross_section = volume_extruded_filament / delta_xyz;
+
+        if (delta_xyz > 0.0f) {
+            float area_toolpath_cross_section = volume_extruded_filament / delta_xyz;
+            m_mm3_per_mm = area_toolpath_cross_section;
+        } else {
+            // Stationary extrusion (e.g. Magma injection) — no spatial displacement
+            m_mm3_per_mm = 0.0f;
+        }
 
         if(m_extrusion_role == ExtrusionRole::erSupportMaterial || m_extrusion_role == ExtrusionRole::erSupportMaterialInterface || m_extrusion_role ==ExtrusionRole::erSupportTransition)
             m_used_filaments.increase_support_caches(volume_extruded_filament);
@@ -3756,8 +3770,6 @@ void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes
             // save extruded volume to the cache
             m_used_filaments.increase_model_caches(volume_extruded_filament);
         }
-        // volume extruded filament / tool displacement = area toolpath cross section
-        m_mm3_per_mm = area_toolpath_cross_section;
 
         if (m_forced_height > 0.0f)
             m_height = m_forced_height;
@@ -3778,6 +3790,9 @@ void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes
 
         if (m_forced_width > 0.0f)
             m_width = m_forced_width;
+        else if (delta_xyz == 0.0f)
+            // Stationary extrusion: no spatial displacement, use default width
+            m_width = DEFAULT_TOOLPATH_WIDTH;
         else if (m_extrusion_role == erExternalPerimeter)
             // cross section: rectangle
             m_width = delta_pos[E] * static_cast<float>(M_PI * sqr(1.05f * filament_radius)) / (delta_xyz * m_height);
@@ -4112,8 +4127,17 @@ void GCodeProcessor::process_VG1(const GCodeReader::GCodeLine& line)
         else if (delta_pos[E] < 0.0f)
             type = (delta_pos[X] != 0.0f || delta_pos[Y] != 0.0f || delta_pos[Z] != 0.0f) ? EMoveType::Travel : EMoveType::Retract;
         else if (delta_pos[E] > 0.0f) {
-            if (delta_pos[X] == 0.0f && delta_pos[Y] == 0.0f)
-                type = (delta_pos[Z] == 0.0f) ? EMoveType::Unretract : EMoveType::Travel;
+            if (delta_pos[X] == 0.0f && delta_pos[Y] == 0.0f) {
+                if (delta_pos[Z] == 0.0f) {
+                    // Magma injection: stationary extrude is real extrusion, not unretract
+                    if (m_extrusion_role == erMagmaInjection)
+                        type = EMoveType::Extrude;
+                    else
+                        type = EMoveType::Unretract;
+                }
+                else
+                    type = EMoveType::Travel;
+            }
             else if (delta_pos[X] != 0.0f || delta_pos[Y] != 0.0f)
                 type = EMoveType::Extrude;
         }

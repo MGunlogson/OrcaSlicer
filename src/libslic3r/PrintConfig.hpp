@@ -75,17 +75,12 @@ enum InfillPattern : int {
     ipCrossHatch, ipTpmsD, ipTpmsFK, ipGyroid,
     ipConcentric, ipHilbertCurve, ipArchimedeanChords, ipOctagramSpiral,
     ipSupportBase, ipConcentricInternal,
-    // Magma infill patterns for vertical reinforcement
-    ipMagmaHex, ipMagmaTriangle,
+    // Magma infill pattern for vertical reinforcement
+    ipMagmaTriangle,
     ipCount,
 };
 
-// Magma pattern selection (separate enum for dropdown UI)
-enum class MagmaPattern : int {
-    Triangle,
-    Hex,
-    Count,
-};
+// MagmaPattern enum removed - outer zone always uses ipMagmaTriangle
 
 enum class IroningType {
     NoIroning,
@@ -1196,22 +1191,35 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloat,                scarf_joint_flow_ratio))
     ((ConfigOptionPercent,              scarf_overhang_threshold))
 
-    // Magma infill configuration
-    ((ConfigOptionBool,                 magma_inner_shell_enabled))
-    ((ConfigOptionEnum<MagmaPattern>,   magma_pattern))
-    ((ConfigOptionFloat,                magma_outer_infill_width))
-    ((ConfigOptionInt,                  magma_inner_shell_line_count))
-    ((ConfigOptionFloatOrPercent,       magma_inner_shell_line_width))
-    ((ConfigOptionFloat,                magma_min_yolk_width))
-    ((ConfigOptionInt,                  magma_shell_solid_layers))
-    ((ConfigOptionFloat,                magma_shell_solid_thickness))
-    // Magma speed configuration (0 = use default speed)
-    ((ConfigOptionFloat,                magma_infill_speed))
-    ((ConfigOptionFloat,                magma_shell_speed))
-    ((ConfigOptionFloat,                magma_floor_speed))
-    ((ConfigOptionFloat,                magma_ceiling_speed))
-    // Magma debug options
-    ((ConfigOptionBool,                 magma_debug_export_shells))
+    // Dual infill zones configuration (inner/outer zones with shell boundary)
+    // Outer zone always uses Magma Triangle infill at 100% density
+    ((ConfigOptionBool,                 dual_infill_enabled))
+    ((ConfigOptionFloat,                dual_infill_outer_width))      // Width of outer zone (mm)
+    ((ConfigOptionInt,                  dual_infill_shell_walls))      // Number of shell walls
+    ((ConfigOptionFloatOrPercent,       dual_infill_shell_width))      // Shell wall line width
+    ((ConfigOptionFloat,                dual_infill_min_inner_width))  // Minimum inner zone width
+    ((ConfigOptionInt,                  dual_infill_solid_layers))     // Solid floor/ceiling layers
+    ((ConfigOptionFloat,                dual_infill_solid_thickness))  // Solid floor/ceiling thickness
+    // Dual infill speed configuration (0 = use default speed)
+    ((ConfigOptionFloat,                dual_infill_outer_speed))
+    ((ConfigOptionFloat,                dual_infill_shell_speed))
+    ((ConfigOptionFloat,                dual_infill_floor_speed))
+    ((ConfigOptionFloat,                dual_infill_ceiling_speed))
+    // Magma Triangle U-tube parameters (pattern-specific, shown when Magma is used)
+    ((ConfigOptionFloat,                magma_interior_width))         // Cell hole size (mm), 0 = auto
+    ((ConfigOptionInt,                  magma_window_height))          // Window gap height (layers), 0 = auto
+    ((ConfigOptionInt,                  magma_tube_height_layers))     // Minimum tube height in layers
+    ((ConfigOptionFloat,                magma_tube_height))            // Minimum tube height in mm (0 = disable)
+    ((ConfigOptionInt,                  magma_stagger_levels))         // Number of stagger groups for window Z-offset
+    ((ConfigOptionFloat,                magma_fill_depth_factor))      // Thermal fudge factor for auto max tube depth
+    ((ConfigOptionFloat,                magma_tube_fill_factor))       // Injection flow ratio (1.0 = calculated)
+    ((ConfigOptionBool,                 magma_spiral_interlock))       // Enable spiral interlock between layers
+    // Magma injection parameters
+    ((ConfigOptionInt,                  magma_injection_temp))         // Injection temperature (0 = no change)
+    ((ConfigOptionFloat,                magma_injection_speed))        // Injection volumetric speed mm³/s (0 = auto)
+    ((ConfigOptionBool,                 magma_iron_tube_ends))         // Iron over tube ends after injection
+    ((ConfigOptionBool,                 magma_injection_park))         // Park nozzle during temp changes
+    ((ConfigOptionInt,                  magma_injection_dwell))        // Dwell time after injection (ms)
 )
 
 PRINT_CONFIG_CLASS_DEFINE(

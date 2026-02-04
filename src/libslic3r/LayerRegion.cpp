@@ -64,11 +64,11 @@ void LayerRegion::slices_to_fill_surfaces_clipped()
     for (size_t surface_type = 0; surface_type < size_t(stCount); ++ surface_type) {
         const SurfacesPtr &this_surfaces = by_surface[surface_type];
         if (! this_surfaces.empty()) {
-            // Magma: Clip floor/ceiling surfaces to yolk (inside shells) rather than fill_expolygons
-            // This keeps floor/ceiling from "escaping" outside the Magma shell perimeters
+            // Zone: Clip floor/ceiling surfaces to inner zone (inside shells) rather than fill_expolygons
+            // This keeps floor/ceiling from "escaping" outside the zone shell perimeters
             SurfaceType st = SurfaceType(surface_type);
-            if ((st == stMagmaFloor || st == stMagmaCeiling) && !this->magma_yolk.empty()) {
-                this->fill_surfaces.append(intersection_ex(this_surfaces, this->magma_yolk), st);
+            if ((st == stZoneFloor || st == stZoneCeiling) && !this->inner_zone.empty()) {
+                this->fill_surfaces.append(intersection_ex(this_surfaces, this->inner_zone), st);
             } else {
                 this->fill_surfaces.append(intersection_ex(this_surfaces, this->fill_expolygons), st);
             }
@@ -125,9 +125,9 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
     g.overhang_flow         = this->bridging_flow(frPerimeter, object_config.thick_bridges);
     g.solid_infill_flow     = this->flow(frSolidInfill);
 
-    // Magma: Pass pre-computed 3D zone boundary and yolk output
-    g.magma_zone_boundary   = &this->layer()->magma_zone_boundary;
-    g.magma_yolk_out        = &this->magma_yolk;
+    // Zone: Pass pre-computed 3D zone boundary and inner zone output
+    g.zone_boundary   = &this->layer()->zone_boundary;
+    g.inner_zone_out        = &this->inner_zone;
 
     if (this->layer()->object()->config().wall_generator.value == PerimeterGeneratorType::Arachne && !spiral_mode)
         g.process_arachne();
@@ -516,18 +516,18 @@ void LayerRegion::process_external_surfaces(const Layer *lower_layer, const Poly
     ExPolygons shells = union_ex(fill_surfaces_extract_expolygons(this->fill_surfaces.surfaces, { stInternalSolid }, layer_thickness));
     ExPolygons sparse = union_ex(fill_surfaces_extract_expolygons(this->fill_surfaces.surfaces, {stInternal}, layer_thickness));
     ExPolygons top_expolygons = union_ex(fill_surfaces_extract_expolygons(this->fill_surfaces.surfaces, {stTop}, layer_thickness));
-    // Magma: Extract outer infill - it becomes an expansion zone (top/bottom/bridges can expand into it)
-    ExPolygons magma_outer = union_ex(fill_surfaces_extract_expolygons(this->fill_surfaces.surfaces, {stMagmaOuterInfill}, layer_thickness));
+    // Zone: Extract outer infill - it becomes an expansion zone (top/bottom/bridges can expand into it)
+    ExPolygons zone_outer = union_ex(fill_surfaces_extract_expolygons(this->fill_surfaces.surfaces, {stZoneOuter}, layer_thickness));
 
     const auto expansion_params_into_sparse_infill = RegionExpansionParameters::build(expansion_min, expansion_step, max_nr_expansion_steps);
     const auto expansion_params_into_solid_infill  = RegionExpansionParameters::build(expansion_bottom_bridge, expansion_step, max_nr_expansion_steps);
 
-    // Expansion zones: [0]=shells, [1]=sparse, [2]=magma_outer, [3]=top
-    // Top is popped after bridge detection. Magma outer is expendable like sparse.
+    // Expansion zones: [0]=shells, [1]=sparse, [2]=zone_outer, [3]=top
+    // Top is popped after bridge detection. Zone outer is expendable like sparse.
     std::vector<ExpansionZone> expansion_zones{
         ExpansionZone{std::move(shells), expansion_params_into_solid_infill},
         ExpansionZone{std::move(sparse), expansion_params_into_sparse_infill},
-        ExpansionZone{std::move(magma_outer), expansion_params_into_sparse_infill},
+        ExpansionZone{std::move(zone_outer), expansion_params_into_sparse_infill},
         ExpansionZone{std::move(top_expolygons), expansion_params_into_solid_infill},
     };
 
@@ -554,7 +554,7 @@ void LayerRegion::process_external_surfaces(const Layer *lower_layer, const Poly
         this->fill_surfaces.append(std::move(expansion_zones.back().expolygons), top_templ);
     }
     expansion_zones.pop_back();
-    // Now: [0]=shells, [1]=sparse, [2]=magma_outer
+    // Now: [0]=shells, [1]=sparse, [2]=zone_outer
 
     // Expand bottom/top surfaces into expansion zones
     expansion_zones.at(0).parameters = RegionExpansionParameters::build(expansion_bottom, expansion_step, max_nr_expansion_steps);
@@ -563,10 +563,10 @@ void LayerRegion::process_external_surfaces(const Layer *lower_layer, const Poly
     expansion_zones.at(0).parameters = RegionExpansionParameters::build(expansion_top, expansion_step, max_nr_expansion_steps);
     Surfaces tops = expand_merge_surfaces(this->fill_surfaces.surfaces, stTop, expansion_zones, closing_radius);
 
-    // Magma: Expand floor/ceiling like bottom/top to get proper shell thickness
+    // Zone: Expand floor/ceiling like bottom/top to get proper shell thickness
     // Floor needs solid layers above it (into yolk), ceiling needs solid layers below it (into yolk)
-    Surfaces magma_floors = expand_merge_surfaces(this->fill_surfaces.surfaces, stMagmaFloor, expansion_zones, closing_radius);
-    Surfaces magma_ceilings = expand_merge_surfaces(this->fill_surfaces.surfaces, stMagmaCeiling, expansion_zones, closing_radius);
+    Surfaces zone_floors = expand_merge_surfaces(this->fill_surfaces.surfaces, stZoneFloor, expansion_zones, closing_radius);
+    Surfaces zone_ceilings = expand_merge_surfaces(this->fill_surfaces.surfaces, stZoneCeiling, expansion_zones, closing_radius);
 
     // Turn too small internal regions into solid regions according to the user setting
     if (!this->layer()->object()->print()->config().spiral_mode && this->region().config().sparse_infill_density.value > 0) {
@@ -585,7 +585,7 @@ void LayerRegion::process_external_surfaces(const Layer *lower_layer, const Poly
 
         ExPolygons small_to_solid;
         move_small_to_solid(expansion_zones[1].expolygons, small_to_solid);  // sparse
-        move_small_to_solid(expansion_zones[2].expolygons, small_to_solid);  // magma_outer
+        move_small_to_solid(expansion_zones[2].expolygons, small_to_solid);  // zone_outer
 
         if (!small_to_solid.empty())
             expansion_zones[0].expolygons = union_ex(expansion_zones[0].expolygons, small_to_solid);
@@ -598,7 +598,7 @@ void LayerRegion::process_external_surfaces(const Layer *lower_layer, const Poly
         zones_expolygons_count += zone.expolygons.size();
     reserve_more(this->fill_surfaces.surfaces,
         zones_expolygons_count + bridges.size() + bottoms.size() + tops.size() +
-        magma_floors.size() + magma_ceilings.size());
+        zone_floors.size() + zone_ceilings.size());
 
     // Re-add zone remainders with their original surface types
     {
@@ -612,17 +612,17 @@ void LayerRegion::process_external_surfaces(const Layer *lower_layer, const Poly
         this->fill_surfaces.append(std::move(expansion_zones[1].expolygons), sparse_templ);
     }
     {
-        Surface magma_outer_templ(stMagmaOuterInfill, {});
-        magma_outer_templ.thickness = layer_thickness;
-        this->fill_surfaces.append(std::move(expansion_zones[2].expolygons), magma_outer_templ);
+        Surface zone_outer_templ(stZoneOuter, {});
+        zone_outer_templ.thickness = layer_thickness;
+        this->fill_surfaces.append(std::move(expansion_zones[2].expolygons), zone_outer_templ);
     }
 
     // Re-add expanded surfaces
     this->fill_surfaces.append(std::move(bridges.surfaces));
     this->fill_surfaces.append(std::move(bottoms));
     this->fill_surfaces.append(std::move(tops));
-    this->fill_surfaces.append(std::move(magma_floors));
-    this->fill_surfaces.append(std::move(magma_ceilings));
+    this->fill_surfaces.append(std::move(zone_floors));
+    this->fill_surfaces.append(std::move(zone_ceilings));
 
 #ifdef SLIC3R_DEBUG_SLICE_PROCESSING
     export_region_fill_surfaces_to_svg_debug("4_process_external_surfaces-final");
@@ -675,8 +675,8 @@ void LayerRegion::process_external_surfaces(const Layer *lower_layer, const Poly
         if (this->layer()->lower_layer != nullptr)
             max_grid_area = this->layer()->lower_layer->get_sparse_infill_max_void_area();
         for (const Surface &surface : this->fill_surfaces.surfaces) {
-            if (surface.is_top() || surface.is_magma_ceiling()) {
-                // Collect the top surfaces (and Magma ceiling), inflate them and trim them by the bottom surfaces.
+            if (surface.is_top() || surface.is_zone_ceiling()) {
+                // Collect the top surfaces (and zone ceiling), inflate them and trim them by the bottom surfaces.
                 // This gives the priority to bottom surfaces.
                 if (max_grid_area < 0 || surface.expolygon.area() < max_grid_area)
                     surfaces_append(top, offset_ex(surface.expolygon, margin, EXTERNAL_SURFACES_OFFSET_PARAMETERS), surface);
@@ -684,18 +684,18 @@ void LayerRegion::process_external_surfaces(const Layer *lower_layer, const Poly
                     //BBS: Don't need to expand too much in this situation. Expand 3mm to eliminate hole and 1mm for contour
                     surfaces_append(top, intersection_ex(offset(surface.expolygon.contour, margin / 3.0, EXTERNAL_SURFACES_OFFSET_PARAMETERS),
                                                          offset_ex(surface.expolygon, margin, EXTERNAL_SURFACES_OFFSET_PARAMETERS)), surface);
-            } else if (surface.surface_type == stBottom || surface.is_magma_floor() || (surface.surface_type == stBottomBridge && lower_layer == nullptr)) {
-                // Grown by 3mm. Magma floor is like bottom - solid surface over sparse infill below.
+            } else if (surface.surface_type == stBottom || surface.is_zone_floor() || (surface.surface_type == stBottomBridge && lower_layer == nullptr)) {
+                // Grown by 3mm. Zone floor is like bottom - solid surface over sparse infill below.
                 surfaces_append(bottom, offset_ex(surface.expolygon, margin, EXTERNAL_SURFACES_OFFSET_PARAMETERS), surface);
             } else if (surface.surface_type == stBottomBridge) {
                 if (! surface.empty())
                     bridges.emplace_back(surface);
             } else if (surface.is_internal()) {
-            	// Internal surfaces: stInternal, stInternalSolid, stMagmaOuterInfill
+            	// Internal surfaces: stInternal, stInternalSolid, stZoneOuter
             	assert(surface.surface_type == stInternal || surface.surface_type == stInternalSolid ||
-            	       surface.surface_type == stMagmaOuterInfill);
-            	// Magma: Don't convert Magma surfaces to void - they need to stay as-is
-            	if (! has_infill && lower_layer != nullptr && !surface.is_magma())
+            	       surface.surface_type == stZoneOuter);
+            	// Zone: Don't convert zone surfaces to void - they need to stay as-is
+            	if (! has_infill && lower_layer != nullptr && !surface.is_zone())
             		polygons_append(voids, surface.expolygon);
             	internal.emplace_back(std::move(surface));
             }

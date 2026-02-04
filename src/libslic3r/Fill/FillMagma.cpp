@@ -1,162 +1,241 @@
 #include "FillMagma.hpp"
+#include "FillBase.hpp"
+#include "../ClipperUtils.hpp"
+#include "../Polyline.hpp"
+#include "../Magma/MagmaTubeMap.hpp"
+#include "../Magma/MagmaSpiralOffset.hpp"
 
 #include <cmath>
+#include <algorithm>
 #include <boost/log/trivial.hpp>
 
 namespace Slic3r {
 
-// Calculate circular spiral offset for interlocking triangles
-//
-// The pattern shifts in a CIRCLE each layer, creating actual spirals.
-// Adjacent tubes spiral around each other, mechanically interlocking when filled.
-//
-// Key insight: We want to spiral as FAST as possible while maintaining 40% overlap.
-//
-// Approach:
-// 1. Radius is constrained by geometry (can't exceed hole or collide with neighbors)
-// 2. Given fixed radius, back-calculate the maximum angle change that maintains 40% overlap
-// 3. This gives the minimum rotation period (fastest possible spiral)
-//
-void FillMagmaTriangle::calculate_spiral_offset(const FillParams &params,
-                                                 float interior_width,
-                                                 float &offset_x, float &offset_y) const
+// ============================================================================
+// Infill Direction — fixed angle, world-origin reference
+// ============================================================================
+
+std::pair<float, Point> FillMagmaTriangle::_infill_direction(const Surface *surface) const
 {
-    const float line_width = params.flow.width();
-
-    // Spiral parameters
-    constexpr float target_overlap = 0.40f;      // 40% overlap (overhang threshold)
-    constexpr int cycle_layers = 3;              // Triangle repeats every 3 layers
-
-    // 1. Calculate spiral radius from geometry constraints
-    // Can't exceed half the hole, can't collide with neighbors
-    const float cell_spacing = interior_width + line_width;
-    const float spiral_radius = std::min(
-        interior_width * 0.5f,                   // Don't exceed half the hole
-        (cell_spacing - line_width) * 0.5f      // Don't collide with neighbors
-    );
-
-    // 2. Calculate max distance between same-direction lines for 40% overlap
-    const float target_distance = (1.0f - target_overlap) * line_width;  // 0.6 * line_width
-
-    // 3. Back-calculate angle change from radius and target distance
-    // For circular motion: distance = 2 * radius * sin(angle_change / 2)
-    // Solving: sin(angle_change / 2) = target_distance / (2 * radius)
-    // But clamp to valid range for arcsin (can't exceed 1.0)
-    const float sin_half_angle = std::min(1.0f, target_distance / (2.0f * spiral_radius));
-    const float angle_change = 2.0f * std::asin(sin_half_angle);
-
-    // 4. Calculate rotation period from angle change
-    // rotation_period = cycle_layers * 2π / angle_change
-    // (This is the minimum rotation period that maintains overlap)
-    const float rotation_period = float(cycle_layers) * 2.0f * float(M_PI) / angle_change;
-
-    // 5. Calculate current layer's position on the spiral circle
-    const float layer_angle = float(this->layer_id) * 2.0f * float(M_PI) / rotation_period;
-
-    offset_x = spiral_radius * std::cos(layer_angle);
-    offset_y = spiral_radius * std::sin(layer_angle);
+    float out_angle = 0.f;
+    if (surface->bridge_angle >= 0)
+        out_angle = float(surface->bridge_angle);
+    return std::make_pair(out_angle, Point(0, 0));
 }
 
-// Convert (x, y) offset to pattern_shift for a line at given angle
-// pattern_shift moves lines perpendicular to their direction
-float FillMagmaTriangle::project_offset_to_shift(float offset_x, float offset_y, float line_angle) const
+// ============================================================================
+// Helpers
+// ============================================================================
+
+// Create a 2-point polyline from world coordinates (mm) for X, scaled Y.
+static Polyline make_horiz_segment(double x0_mm, double x1_mm, coord_t y_scaled)
 {
-    // Perpendicular direction to line_angle is (line_angle + 90°)
-    // pattern_shift = dot((offset_x, offset_y), perpendicular_unit_vector)
-    // perpendicular = (-sin(line_angle), cos(line_angle))
-    return -offset_x * std::sin(line_angle) + offset_y * std::cos(line_angle);
+    Polyline pl;
+    pl.points.push_back(Point(coord_t(scale_(x0_mm)), y_scaled));
+    pl.points.push_back(Point(coord_t(scale_(x1_mm)), y_scaled));
+    return pl;
 }
 
-Polylines FillMagmaTriangle::fill_surface(const Surface *surface, const FillParams &params)
+// Subtract sorted, merged gap intervals from a range [lo, hi].
+// Emits kept segments to `out` via the callback.
+template<typename EmitFn>
+static void subtract_gaps(double lo, double hi,
+                          const std::vector<std::pair<double, double>> &gaps,
+                          EmitFn emit)
 {
-    Polylines polylines_out;
+    double cursor = lo;
+    for (const auto &gap : gaps) {
+        double gl = std::max(gap.first, lo);
+        double gr = std::min(gap.second, hi);
+        if (gr <= gl)
+            continue;
+        if (gl > cursor + 0.01)
+            emit(cursor, gl);
+        cursor = std::max(cursor, gr);
+    }
+    if (hi > cursor + 0.01)
+        emit(cursor, hi);
+}
 
-    // Magma interior width: max dimension of triangular hole
-    // For injection to work, nozzle must seal against the tube opening.
-    // interior_width = nozzle_diameter + 0.2mm for sealing
-    // TODO: Get from config, for now hardcode based on typical 0.4mm nozzle
-    constexpr float interior_width = 0.6f;  // mm (nozzle + 0.2)
-
-    const float line_width = params.flow.width();  // ~0.45mm
-
-    // Line spacing = interior_width + line_width
-    // This gives the center-to-center distance between parallel lines
-    const float target_line_spacing = interior_width + line_width;
-
-    // Save and override this->spacing
-    // fill_surface_by_multilines uses formula: line_spacing = spacing * multiline / density
-    // After density /= num_directions: effective line_spacing = spacing * multiline * num_directions / density
-    // With density=1.0, multiline=1, num_directions=3: line_spacing = spacing * 3
-    // So: spacing = target_line_spacing / 3
-    double original_spacing = this->spacing;
-    const_cast<FillMagmaTriangle*>(this)->spacing = target_line_spacing / 3.0;
-
-    // Use full density (100%) - Magma doesn't use density concept
-    FillParams magma_params = params;
-    magma_params.density = 1.0f;
-
-    // Calculate circular spiral offset for this layer
-    float offset_x, offset_y;
-    this->calculate_spiral_offset(magma_params, interior_width, offset_x, offset_y);
-
-    // Triangle pattern: 3 sweeps at 0°, 60°, 120°
-    // Each direction gets a different pattern_shift based on projecting
-    // the circular (x,y) offset onto that direction's perpendicular axis.
-    // This creates true circular motion of the triangle intersection points.
-    constexpr float angle_0   = 0.f;
-    constexpr float angle_60  = float(M_PI / 3.);
-    constexpr float angle_120 = float(2. * M_PI / 3.);
-
-    const float shift_0   = this->project_offset_to_shift(offset_x, offset_y, angle_0);
-    const float shift_60  = this->project_offset_to_shift(offset_x, offset_y, angle_60);
-    const float shift_120 = this->project_offset_to_shift(offset_x, offset_y, angle_120);
-
-    if (magma_params.multiline > 1) {
-        // Thick infill mode - use trapezoidal geometry
-        // For trapezoidal, we use 0° and 90° directions
-        const float shift_90 = this->project_offset_to_shift(offset_x, offset_y, float(M_PI / 2.));
-        if (!this->fill_surface_trapezoidal(
-                surface, magma_params,
-                { { 0.f, shift_0 }, { float(M_PI / 2.), shift_90 } },
-                polylines_out, 1))
-            BOOST_LOG_TRIVIAL(error) << "FillMagmaTriangle::fill_surface_trapezoidal() failed.";
-    } else {
-        // Standard triangle: 3 line directions at 60° intervals
-        // Each direction gets its projected shift for circular motion
-        if (!this->fill_surface_by_multilines(
-                surface, magma_params,
-                { { angle_0, shift_0 },
-                  { angle_60, shift_60 },
-                  { angle_120, shift_120 } },
-                polylines_out))
-            BOOST_LOG_TRIVIAL(error) << "FillMagmaTriangle::fill_surface() failed to fill a region.";
+// Split a line segment p0→p1 by removing Y intervals where gaps exist.
+// Gaps are in world-space Y coordinates. The line must have non-zero Y span.
+static void split_line_by_y_gaps(
+    const Vec2d &p0, const Vec2d &p1,
+    const std::vector<std::pair<double, double>> &y_gaps,
+    Polylines &out)
+{
+    double dy = p1.y() - p0.y();
+    if (std::abs(dy) < 1e-6) {
+        // Degenerate — no Y span, can't split by Y
+        Polyline pl;
+        pl.points.push_back(Point(scale_(p0.x()), scale_(p0.y())));
+        pl.points.push_back(Point(scale_(p1.x()), scale_(p1.y())));
+        out.push_back(std::move(pl));
+        return;
     }
 
-    // Restore original spacing
-    const_cast<FillMagmaTriangle*>(this)->spacing = original_spacing;
+    double y_lo = std::min(p0.y(), p1.y());
+    double y_hi = std::max(p0.y(), p1.y());
 
-    return polylines_out;
+    // Convert Y intervals to parametric t values along p0→p1
+    // P(t) = p0 + t*(p1 - p0), t ∈ [0, 1]
+    // t = (y - p0.y) / dy
+    auto y_to_t = [&](double y) { return (y - p0.y()) / dy; };
+    auto t_to_point = [&](double t) -> Vec2d {
+        return Vec2d(p0.x() + t * (p1.x() - p0.x()),
+                     p0.y() + t * dy);
+    };
+
+    // Collect gap t-intervals
+    std::vector<std::pair<double, double>> t_gaps;
+    for (const auto &gap : y_gaps) {
+        double gl = std::max(gap.first, y_lo);
+        double gr = std::min(gap.second, y_hi);
+        if (gr <= gl)
+            continue;
+        double t0 = y_to_t(gl);
+        double t1 = y_to_t(gr);
+        if (t0 > t1) std::swap(t0, t1);
+        t_gaps.push_back({t0, t1});
+    }
+
+    if (t_gaps.empty()) {
+        Polyline pl;
+        pl.points.push_back(Point(scale_(p0.x()), scale_(p0.y())));
+        pl.points.push_back(Point(scale_(p1.x()), scale_(p1.y())));
+        out.push_back(std::move(pl));
+        return;
+    }
+
+    std::sort(t_gaps.begin(), t_gaps.end());
+
+    subtract_gaps(0.0, 1.0, t_gaps, [&](double t_lo, double t_hi) {
+        Vec2d a = t_to_point(t_lo);
+        Vec2d b = t_to_point(t_hi);
+        Polyline pl;
+        pl.points.push_back(Point(scale_(a.x()), scale_(a.y())));
+        pl.points.push_back(Point(scale_(b.x()), scale_(b.y())));
+        out.push_back(std::move(pl));
+    });
 }
 
-// FillMagmaHex - placeholder implementation
-// Currently delegates to standard honeycomb, will be enhanced with Magma features
-Polylines FillMagmaHex::fill_surface(const Surface *surface, const FillParams &params)
+// ============================================================================
+// Main Fill — Direct Lattice Generation
+// ============================================================================
+
+void FillMagmaTriangle::_fill_surface_single(
+    const FillParams &params,
+    unsigned int       thickness_layers,
+    const std::pair<float, Point> &direction,
+    ExPolygon          expolygon,
+    Polylines         &polylines_out)
 {
-    Polylines polylines_out;
+    if (!this->tube_map) {
+        BOOST_LOG_TRIVIAL(error) << "FillMagmaTriangle: null tube_map on layer " << this->layer_id;
+        return;
+    }
 
-    // TODO: Implement hex-specific Magma pattern
-    // For now, use standard triangle as placeholder
-    // (Hex requires different geometry - will implement separately)
+    const double cs   = this->tube_map->cell_spacing();
+    const int    layer = static_cast<int>(this->layer_id);
 
-    BOOST_LOG_TRIVIAL(warning) << "FillMagmaHex: Using triangle pattern as placeholder";
+    // Build lattice with spiral offset for this layer
+    magma::TriangleLattice lattice = magma::lattice_for_layer(
+        cs, this->tube_map->spiral_params(), layer);
 
-    if (!this->fill_surface_by_multilines(
-            surface, params,
-            { { 0.f, 0.f }, { float(M_PI / 3.), 0.f }, { float(2. * M_PI / 3.), 0.f } },
-            polylines_out))
-        BOOST_LOG_TRIVIAL(error) << "FillMagmaHex::fill_surface() failed to fill a region.";
+    const double edge  = lattice.edge_length();
+    const double off_x = lattice.offset_x();
+    const double off_y = lattice.offset_y();
 
-    return polylines_out;
+    // Get window gaps (pre-computed by tube map, correct shared-edge detection)
+    magma::WindowGaps gaps = this->tube_map->window_gaps(layer);
+
+    // ---- Bounding box → lattice ranges ----
+
+    BoundingBox bbox = expolygon.contour.bounding_box();
+    double x_min = unscale<double>(bbox.min.x()) - edge;
+    double x_max = unscale<double>(bbox.max.x()) + edge;
+    double y_min = unscale<double>(bbox.min.y()) - cs;
+    double y_max = unscale<double>(bbox.max.y()) + cs;
+
+    // Row range (horizontal lines, constant b)
+    int row_min = static_cast<int>(std::floor((y_min - off_y) / cs));
+    int row_max = static_cast<int>(std::ceil((y_max - off_y) / cs));
+
+    // Column range (60° lines, constant a)
+    // to_world(a, b).x = a*edge + b*edge/2 + off_x
+    // Conservative: use extreme b values that push x furthest
+    int col_min = static_cast<int>(std::floor(
+        (x_min - off_x - std::max(row_min, row_max) * edge * 0.5) / edge)) - 1;
+    int col_max = static_cast<int>(std::ceil(
+        (x_max - off_x - std::min(row_min, row_max) * edge * 0.5) / edge)) + 1;
+
+    // Diagonal range (120° lines, constant s = a + b)
+    int diag_min = col_min + row_min - 1;
+    int diag_max = col_max + row_max + 1;
+
+    // ---- Generate lines with gaps built in ----
+
+    Polylines all_lines;
+
+    // --- Horizontal lines (one per row b) ---
+    for (int b = row_min; b <= row_max; ++b) {
+        coord_t y_s = coord_t(scale_(b * cs + off_y));
+
+        auto it = gaps.horiz.find(b);
+        if (it == gaps.horiz.end()) {
+            // No gaps — single spanning line
+            all_lines.push_back(make_horiz_segment(x_min, x_max, y_s));
+        } else {
+            // Subtract gap X intervals from [x_min, x_max]
+            subtract_gaps(x_min, x_max, it->second, [&](double lo, double hi) {
+                all_lines.push_back(make_horiz_segment(lo, hi, y_s));
+            });
+        }
+    }
+
+    // --- 60° lines (one per column a) ---
+    for (int a = col_min; a <= col_max; ++a) {
+        Vec2d p0 = lattice.to_world(a, row_min - 1);
+        Vec2d p1 = lattice.to_world(a, row_max + 1);
+
+        auto it = gaps.col60.find(a);
+        if (it == gaps.col60.end()) {
+            Polyline pl;
+            pl.points.push_back(Point(scale_(p0.x()), scale_(p0.y())));
+            pl.points.push_back(Point(scale_(p1.x()), scale_(p1.y())));
+            all_lines.push_back(std::move(pl));
+        } else {
+            split_line_by_y_gaps(p0, p1, it->second, all_lines);
+        }
+    }
+
+    // --- 120° lines (one per diagonal s = a + b) ---
+    for (int s = diag_min; s <= diag_max; ++s) {
+        // Line goes through lattice vertices (s - b, b) as b increases.
+        // Direction in world: to_world(s-b, b) → to_world(s-b-1, b+1)
+        //   Δworld = (-edge + edge/2, cs) = (-edge/2, cs)
+        Vec2d p0 = lattice.to_world(s - (row_min - 1), row_min - 1);
+        Vec2d p1 = lattice.to_world(s - (row_max + 1), row_max + 1);
+
+        auto it = gaps.diag120.find(s);
+        if (it == gaps.diag120.end()) {
+            Polyline pl;
+            pl.points.push_back(Point(scale_(p0.x()), scale_(p0.y())));
+            pl.points.push_back(Point(scale_(p1.x()), scale_(p1.y())));
+            all_lines.push_back(std::move(pl));
+        } else {
+            split_line_by_y_gaps(p0, p1, it->second, all_lines);
+        }
+    }
+
+    // ---- Clip to polygon and anchor ----
+
+    // Clip all lines to the fill polygon boundary
+    all_lines = intersection_pl(std::move(all_lines), expolygon);
+
+    // Anchor to perimeter walls + optimize travel path
+    chain_or_connect_infill(std::move(all_lines), expolygon,
+                            polylines_out, this->spacing, params);
 }
 
 } // namespace Slic3r

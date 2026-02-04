@@ -581,10 +581,11 @@ std::string ExtrusionEntity::role_to_string(ExtrusionRole role)
         case erSupportTransition            : return L("Support transition");
         case erWipeTower                    : return L("Prime tower");
         case erCustom                       : return L("Custom");
-        case erMagmaInfill                  : return L("Magma infill");
-        case erMagmaShell                   : return L("Magma shell");
-        case erMagmaFloor                   : return L("Magma floor");
-        case erMagmaCeiling                 : return L("Magma ceiling");
+        case erZoneOuterInfill              : return L("Outer zone infill");
+        case erZoneShell                    : return L("Zone shell");
+        case erZoneFloor                    : return L("Zone floor");
+        case erZoneCeiling                  : return L("Zone ceiling");
+        case erMagmaInjection               : return L("Magma injection");
         case erMixed                        : return L("Multiple");
         default                             : assert(false);
     }
@@ -629,14 +630,16 @@ ExtrusionRole ExtrusionEntity::string_to_role(const std::string_view role)
         return erWipeTower;
     else if (role == L("Custom"))
         return erCustom;
-    else if (role == L("Magma infill"))
-        return erMagmaInfill;
-    else if (role == L("Magma shell"))
-        return erMagmaShell;
-    else if (role == L("Magma floor"))
-        return erMagmaFloor;
-    else if (role == L("Magma ceiling"))
-        return erMagmaCeiling;
+    else if (role == L("Outer zone infill"))
+        return erZoneOuterInfill;
+    else if (role == L("Zone shell"))
+        return erZoneShell;
+    else if (role == L("Zone floor"))
+        return erZoneFloor;
+    else if (role == L("Zone ceiling"))
+        return erZoneCeiling;
+    else if (role == L("Magma injection"))
+        return erMagmaInjection;
     else if (role == L("Multiple"))
         return erMixed;
     else

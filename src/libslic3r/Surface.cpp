@@ -42,10 +42,10 @@ const char* surface_type_to_color_name(const SurfaceType surface_type)
         case stInternalBridge:  return "rgb(0,255,255)";
         case stInternalVoid:    return "rgb(128,128,128)";
         case stPerimeter:       return "rgb(128,0,0)"; // maroon
-        // Magma surface types
-        case stMagmaOuterInfill: return "rgb(255,165,0)"; // orange
-        case stMagmaFloor:       return "rgb(255,140,0)"; // darkorange
-        case stMagmaCeiling:     return "rgb(255,127,80)"; // coral
+        // Dual infill zone surface types
+        case stZoneOuter:   return "rgb(255,165,0)"; // orange
+        case stZoneFloor:   return "rgb(255,140,0)"; // darkorange
+        case stZoneCeiling: return "rgb(255,127,80)"; // coral
         default:                return "rgb(64,64,64)";
     };
 }

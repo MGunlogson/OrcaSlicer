@@ -353,8 +353,8 @@ struct PerimeterGeneratorArachneExtrusion
     Arachne::ExtrusionLine* extrusion = nullptr;
     // Indicates if closed ExtrusionLine is a contour or a hole. Used it only when ExtrusionLine is a closed loop.
     bool is_contour = false;
-    // Magma: Indicates if this extrusion is part of the inner shell walls
-    bool is_magma_shell = false;
+    // Zone: Indicates if this extrusion is part of the inner shell walls
+    bool is_zone_shell = false;
 };
 
 static ExtrusionEntityCollection traverse_extrusions(const PerimeterGenerator& perimeter_generator, std::vector<PerimeterGeneratorArachneExtrusion>& pg_extrusions,
@@ -372,8 +372,8 @@ static ExtrusionEntityCollection traverse_extrusions(const PerimeterGenerator& p
 
         const bool    is_external = extrusion->inset_idx == 0;
         ExtrusionRole role;
-        if (pg_extrusion.is_magma_shell) {
-            role = erMagmaShell;  // Magma inner shell walls use dedicated role
+        if (pg_extrusion.is_zone_shell) {
+            role = erZoneShell;  // Zone shell walls use dedicated role
         } else if (is_external) {
             role = erExternalPerimeter;
         } else {
@@ -2163,8 +2163,8 @@ void PerimeterGenerator::process_arachne()
         Arachne::WallToolPaths wallToolPaths(last_p, bead_width_0, perimeter_spacing, coord_t(loop_number + 1),
                                                wall_0_inset, layer_height, input_params_tmp);
         std::vector<Arachne::VariableWidthLines>   perimeters = wallToolPaths.getToolPaths();
-        // Magma: Track which ExtrusionLine pointers are from inner shell walls
-        std::unordered_set<Arachne::ExtrusionLine*> magma_shell_lines;
+        // Zone: Track which ExtrusionLine pointers are from inner shell walls
+        std::unordered_set<Arachne::ExtrusionLine*> zone_shell_lines;
         ExPolygons  infill_contour = union_ex(wallToolPaths.getInnerContour());
 
         // Check if there are some remaining perimeters to generate (the number of perimeters
@@ -2241,32 +2241,32 @@ void PerimeterGenerator::process_arachne()
 
         loop_number = int(perimeters.size()) - 1;
 
-        // Magma: Generate inner shell walls if enabled
-        if (this->config->magma_inner_shell_enabled && !infill_contour.empty()) {
-            // Require pre-computed 3D zone boundary from PrintObject::compute_magma_shell()
-            if (!this->magma_zone_boundary || this->magma_zone_boundary->empty())
-                goto magma_shell_done;
+        // Zone: Generate inner shell walls if enabled
+        if (this->config->dual_infill_enabled && !infill_contour.empty()) {
+            // Require pre-computed 3D zone boundary from PrintObject::compute_zone_boundary()
+            if (!this->zone_boundary || this->zone_boundary->empty())
+                goto zone_shell_done;
 
             // Intersect 3D boundary with infill_contour to get the boundary within this region.
-            // Note: 3D voxel-based filtering (magma_min_yolk_width) already removes thin sections.
+            // Note: 3D voxel-based filtering (dual_infill_min_inner_width) already removes thin sections.
             // We DON'T apply opening_ex here because:
             // 1. Regular perimeters work without it
             // 2. It would change the boundary, causing mismatch with floor/ceiling detection
             //    which uses zone_boundary directly
-            ExPolygons inner_shell_boundary = intersection_ex(*this->magma_zone_boundary, infill_contour);
+            ExPolygons inner_shell_boundary = intersection_ex(*this->zone_boundary, infill_contour);
             if (!inner_shell_boundary.empty()) {
                 // Generate inner shell walls using WallToolPaths
                 coord_t shell_line_width = perimeter_spacing;
-                if (this->config->magma_inner_shell_line_width.value > 0) {
+                if (this->config->dual_infill_shell_width.value > 0) {
                     double nozzle_diam = this->print_config->nozzle_diameter.get_at(this->config->wall_filament - 1);
-                    shell_line_width = scale_(this->config->magma_inner_shell_line_width.get_abs_value(nozzle_diam));
+                    shell_line_width = scale_(this->config->dual_infill_shell_width.get_abs_value(nozzle_diam));
                 }
 
                 // Convert to polygons - no opening_ex cleaning to keep boundary consistent
                 // with zone_boundary used in floor/ceiling detection
                 Polygons shell_polygons = to_polygons(inner_shell_boundary);
                 if (shell_polygons.empty())
-                    goto magma_shell_done;
+                    goto zone_shell_done;
 
                 // Remove degenerate polygons (less than 3 points or near-zero area)
                 shell_polygons.erase(
@@ -2277,13 +2277,13 @@ void PerimeterGenerator::process_arachne()
                         }),
                     shell_polygons.end());
                 if (shell_polygons.empty())
-                    goto magma_shell_done;
+                    goto zone_shell_done;
 
                 Arachne::WallToolPaths innerShellPaths(
                     shell_polygons,
                     shell_line_width,
                     shell_line_width,
-                    this->config->magma_inner_shell_line_count,
+                    this->config->dual_infill_shell_walls,
                     0,
                     layer_height,
                     input_params_tmp
@@ -2297,19 +2297,19 @@ void PerimeterGenerator::process_arachne()
                     }
                 }
 
-                // Insert inner shell walls and track pointers for erMagmaShell role
+                // Insert inner shell walls and track pointers for erZoneShell role
                 size_t perimeters_before = perimeters.size();
                 perimeters.insert(perimeters.end(),
                     inner_shell_walls.begin(), inner_shell_walls.end());
                 // Mark all ExtrusionLines from inner shell walls for special treatment
                 for (size_t i = perimeters_before; i < perimeters.size(); ++i) {
                     for (Arachne::ExtrusionLine& line : perimeters[i]) {
-                        magma_shell_lines.insert(&line);
+                        zone_shell_lines.insert(&line);
                     }
                 }
 
                 // Update infill_contour to exclude shell wall area while preserving:
-                // - Magma outer zone (between model perimeter and shell outer edge) for U-tube infill
+                // - Outer zone (between model perimeter and shell outer edge) for U-tube infill
                 // - Yolk (inside shell walls) for sparse infill
                 //
                 // We use inner_shell_boundary (same as zone_boundary clipped to infill_contour)
@@ -2322,10 +2322,10 @@ void PerimeterGenerator::process_arachne()
                 ExPolygons outer_zone = diff_ex(infill_contour, inner_shell_boundary);
                 ExPolygons yolk = union_ex(innerShellPaths.getInnerContour());
 
-                // Magma: Store yolk for floor/ceiling clipping in slices_to_fill_surfaces_clipped()
-                // This ensures floor/ceiling surfaces stay within the Magma shell boundary
-                if (this->magma_yolk_out != nullptr) {
-                    *this->magma_yolk_out = yolk;  // Copy before we move
+                // Zone: Store inner zone for floor/ceiling clipping in slices_to_fill_surfaces_clipped()
+                // This ensures floor/ceiling surfaces stay within the zone shell boundary
+                if (this->inner_zone_out != nullptr) {
+                    *this->inner_zone_out = yolk;  // Copy before we move
                 }
 
                 infill_contour = std::move(outer_zone);
@@ -2333,7 +2333,7 @@ void PerimeterGenerator::process_arachne()
                 infill_contour = union_ex(infill_contour);
             }
         }
-        magma_shell_done:
+        zone_shell_done:
 
         #ifdef ARACHNE_DEBUG
         {
@@ -2437,7 +2437,7 @@ void PerimeterGenerator::process_arachne()
             }
 
             auto& best_path = all_extrusions[best_candidate];
-            bool is_shell = magma_shell_lines.count(best_path) > 0;
+            bool is_shell = zone_shell_lines.count(best_path) > 0;
             ordered_extrusions.push_back({ best_path, best_path->is_contour(), is_shell });
             processed[best_candidate] = true;
             for (size_t unlocked_idx : blocking[best_candidate])
@@ -2609,8 +2609,8 @@ void PerimeterGenerator::process_arachne()
         }
 
         // Append infill areas as stInternal
-        // Note: Magma floor/ceiling detection happens in detect_surfaces_type()
-        // which classifies surfaces including stMagmaFloor/stMagmaCeiling.
+        // Note: Zone floor/ceiling detection happens in detect_surfaces_type()
+        // which classifies surfaces including stZoneFloor/stZoneCeiling.
         // Zone splitting (inner/outer) happens later when fill_surfaces is rebuilt.
         this->fill_surfaces->append(infill_exp, stInternal);
 

@@ -68,11 +68,12 @@ struct Settings
 		        true, // Brim
 		        true, // SupportTransition
 		        true, // Mixed
-		        // Magma
-		        true, // MagmaInfill
-		        true, // MagmaShell
-		        true, // MagmaFloor
-		        true, // MagmaCeiling
+		        // Dual Infill Zones
+		        true, // ZoneOuterInfill
+		        true, // ZoneShell
+		        true, // ZoneFloor
+		        true, // ZoneCeiling
+		        true, // MagmaInjection
 		};
 };
 
