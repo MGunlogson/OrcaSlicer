@@ -40,16 +40,10 @@ void regenerate_mesh_from_grid(sla::Interior &interior)
 
 void smooth_interior(sla::Interior &interior, const TriangleMesh &original_mesh, int iterations)
 {
-    std::cerr << "Zone DEBUG smooth_interior: gridptr=" << (interior.gridptr ? "valid" : "null")
-              << " iterations=" << iterations
-              << " mesh_empty=" << interior.mesh.empty() << std::endl;
-
     // Note: interior.mesh may be empty if filter_thin_interior() was called first
     // We only need the grid for smoothing - mesh is regenerated at the end
-    if (!interior.gridptr || iterations <= 0) {
-        std::cerr << "Zone DEBUG smooth_interior: early return (no grid or iterations)" << std::endl;
+    if (!interior.gridptr || iterations <= 0)
         return;
-    }
 
     BOOST_LOG_TRIVIAL(info) << "Zone boundary: Applying constrained smoothing (" << iterations << " iterations)";
 
@@ -90,7 +84,29 @@ void smooth_interior(sla::Interior &interior, const TriangleMesh &original_mesh,
 
     const int smooth_passes_per_clamp = 5;  // Batch 5 smooth passes before clamping
 
+    // Convergence detection via L1 energy (sum of |SDF| over all active voxels).
+    // This is an O(N) read-only pass — trivial overhead vs the O(N) smoothing passes
+    // with heavy per-voxel computation. Covers ALL voxels, so sharp features that
+    // affect few voxels but change significantly are still detected proportionally.
+    auto compute_l1_energy = [&]() -> double {
+        double energy = 0;
+        for (auto iter = interior.gridptr->cbeginValueOn(); iter; ++iter)
+            energy += std::abs(iter.getValue());
+        return energy;
+    };
+
+    double prev_energy = compute_l1_energy();
+    double prev_rel_change = 0;
+
+    BOOST_LOG_TRIVIAL(info) << "Zone boundary: Smoothing " << interior.gridptr->activeVoxelCount()
+        << " active voxels, " << iterations << " max iterations x " << smooth_passes_per_clamp << " passes";
+
+    auto t_smooth_start = std::chrono::high_resolution_clock::now();
+
+    int actual_iterations = 0;
     for (int i = 0; i < iterations; ++i) {
+        auto t_iter = std::chrono::high_resolution_clock::now();
+
         openvdb::tools::LevelSetFilter<openvdb::FloatGrid> filter(*interior.gridptr);
 
         // Apply multiple smoothing passes before clamping
@@ -100,17 +116,40 @@ void smooth_interior(sla::Interior &interior, const TriangleMesh &original_mesh,
 
         // Clamp to valid zone using csgIntersectionCopy (preserves both inputs)
         interior.gridptr = openvdb::tools::csgIntersectionCopy(*interior.gridptr, *valid_zone_grid);
+
+        ++actual_iterations;
+
+        // Convergence check: relative change in L1 energy
+        double curr_energy = compute_l1_energy();
+        double rel_change = (prev_energy > 0) ? std::abs(curr_energy - prev_energy) / prev_energy : 0;
+
+        auto iter_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::high_resolution_clock::now() - t_iter).count();
+
+        BOOST_LOG_TRIVIAL(debug) << "Zone boundary: Smooth iter " << (i + 1) << "/" << iterations
+            << " " << iter_ms << "ms, L1=" << curr_energy << ", rel_change=" << rel_change;
+
+        // Plateau detection: if rel_change stopped decreasing, the smooth/clamp
+        // cycle has reached equilibrium. No fixed threshold — adapts to the model.
+        // Skip iter 0 (first iteration is always a large initial change).
+        if (i > 0 && prev_rel_change > 0 && rel_change >= 0.5 * prev_rel_change) {
+            BOOST_LOG_TRIVIAL(info) << "Zone boundary: Smooth plateaued at iteration " << (i + 1)
+                << "/" << iterations << " (rel_change=" << rel_change << ")";
+            break;
+        }
+
+        prev_rel_change = rel_change;
+        prev_energy = curr_energy;
     }
 
-    std::cerr << "Zone DEBUG smooth_interior: applied " << (iterations * smooth_passes_per_clamp)
-              << " smoothing passes (" << iterations << " iterations x " << smooth_passes_per_clamp << " passes)" << std::endl;
+    auto smooth_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::high_resolution_clock::now() - t_smooth_start).count();
+    BOOST_LOG_TRIVIAL(info) << "Zone boundary: Smooth complete: " << actual_iterations
+        << "/" << iterations << " iterations in " << smooth_ms << "ms";
 
     // Convert smoothed grid back to mesh
     double adaptivity = 0.;
     interior.mesh = grid_to_mesh(*interior.gridptr, 0.0, adaptivity);
-
-    std::cerr << "Zone DEBUG smooth_interior: after grid_to_mesh, mesh_empty=" << interior.mesh.empty()
-              << " triangles=" << interior.mesh.indices.size() << std::endl;
 
     if (!interior.mesh.empty()) {
         // Post-process mesh as in generate_interior
@@ -121,9 +160,6 @@ void smooth_interior(sla::Interior &interior, const TriangleMesh &original_mesh,
         its_merge_vertices(interior.mesh);
         swap_normals(interior.mesh);
     }
-
-    std::cerr << "Zone DEBUG smooth_interior: final mesh_empty=" << interior.mesh.empty()
-              << " triangles=" << interior.mesh.indices.size() << std::endl;
 
     BOOST_LOG_TRIVIAL(info) << "Zone boundary: Constrained smoothing complete";
 }
@@ -140,10 +176,6 @@ void filter_thin_interior(sla::Interior &interior, double min_width)
     float threshold = float(min_width / 2.0 * interior.voxel_scale);
     int threshold_voxels = int(std::ceil(threshold));
 
-    std::cerr << "Zone DEBUG filter_thin_interior: min_width=" << min_width
-              << "mm threshold=" << threshold << " voxels (" << threshold_voxels << " int)"
-              << " voxel_scale=" << interior.voxel_scale << std::endl;
-
     // 1. Extract mask of "thick core" - voxels where inscribed sphere radius >= threshold
     //    sdfInteriorMask returns mask where SDF <= isovalue
     //    Negative threshold = voxels at least threshold from boundary
@@ -152,22 +184,15 @@ void filter_thin_interior(sla::Interior &interior, double min_width)
     if (!thick_mask || thick_mask->tree().activeVoxelCount() == 0) {
         // No thick regions survive - clear the interior
         BOOST_LOG_TRIVIAL(warning) << "Zone boundary: No regions thick enough to survive filtering (min_width=" << min_width << "mm)";
-        std::cerr << "Zone DEBUG filter_thin_interior: no thick regions survive, clearing interior" << std::endl;
         interior.gridptr->clear();
         interior.mesh.clear();
         return;
     }
 
-    size_t core_voxels = thick_mask->tree().activeVoxelCount();
-    std::cerr << "Zone DEBUG filter_thin_interior: thick core has " << core_voxels << " voxels" << std::endl;
-
     // 2. Dilate mask back to reach original surface (BINARY dilation = EXACT)
     openvdb::tools::dilateActiveValues(thick_mask->tree(), threshold_voxels,
                                         openvdb::tools::NN_FACE_EDGE_VERTEX,
                                         openvdb::tools::PRESERVE_TILES);
-
-    size_t dilated_voxels = thick_mask->tree().activeVoxelCount();
-    std::cerr << "Zone DEBUG filter_thin_interior: dilated mask has " << dilated_voxels << " voxels" << std::endl;
 
     // 3. Use mask to carve original level set
     //    Keep original SDF where mask is active, set to background (outside) elsewhere
@@ -184,9 +209,6 @@ void filter_thin_interior(sla::Interior &interior, double min_width)
             kept_count++;
         }
     }
-
-    std::cerr << "Zone DEBUG filter_thin_interior: kept " << kept_count
-              << " voxels, removed " << removed_count << " voxels" << std::endl;
 
     // Prune inactive voxels
     openvdb::tools::pruneInactive(interior.gridptr->tree());

@@ -1590,8 +1590,10 @@ void PrintObject::compute_zone_boundary()
             break;
         }
     }
-    if (!zone_enabled || m_layers.empty())
+    if (!zone_enabled || m_layers.empty()) {
+        m_zone_interior.reset();
         return;
+    }
 
     // Get zone config from first enabled region
     double outer_width = 0;
@@ -1613,7 +1615,7 @@ void PrintObject::compute_zone_boundary()
     // Generate 3D interior shell using SLA hollowing infrastructure
     sla::HollowingConfig cfg;
     cfg.min_thickness = outer_width;
-    cfg.quality = 1.0;  // High quality voxelization
+    cfg.quality = 0.0;  // Low resolution (0.29mm voxels) — sufficient for zone classification, smoothing blurs voxel artifacts
     cfg.closing_distance = 0.5;
 
     TriangleMesh mesh = this->model_object()->raw_mesh();

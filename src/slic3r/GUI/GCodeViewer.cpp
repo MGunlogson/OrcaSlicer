@@ -2106,7 +2106,6 @@ void GCodeViewer::rebuild_zone_volumes()
         }
     }
 
-    std::cerr << "Zone DEBUG: Built " << loaded_count << " volumes for stage " << stage_idx << std::endl;
 }
 
 // Zone boundary: Load and cache interior shell meshes for preview (called after slicing)
@@ -2119,8 +2118,6 @@ void GCodeViewer::load_zone_shells(const Print& print)
 
     if (print.objects().empty())
         return;
-
-    std::cerr << "Zone DEBUG: Loading shells for " << print.objects().size() << " objects" << std::endl;
 
     // Cache all stages for all objects
     for (const PrintObject* obj : print.objects()) {
@@ -2146,14 +2143,11 @@ void GCodeViewer::load_zone_shells(const Print& print)
                 cached.stage_meshes[s] = TriangleMesh(*meshes[s]);
                 cached.stage_meshes[s].transform(obj->trafo_centered().inverse());
                 cached.has_data = true;
-                std::cerr << "Zone DEBUG: Cached stage " << s << " with "
-                          << meshes[s]->indices.size() << " triangles" << std::endl;
             }
         }
 
         // Fallback: use final interior if stages empty
         if (!cached.has_data && obj->has_zone_interior()) {
-            std::cerr << "Zone DEBUG: Using interior mesh fallback" << std::endl;
             TriangleMesh mesh(obj->zone_interior_mesh());
             mesh.transform(obj->trafo_centered().inverse());
             for (int s = 0; s < 3; ++s) {
@@ -2188,7 +2182,6 @@ void GCodeViewer::cycle_zone_boundary_stage()
         case ZoneBoundaryStage::Smoothed: next = ZoneBoundaryStage::Initial;  break;
     }
     set_zone_boundary_stage(next);
-    std::cerr << "Zone DEBUG: Cycled to stage " << static_cast<int>(m_zone_shells.stage) << std::endl;
 }
 
 void GCodeViewer::render_toolpaths()

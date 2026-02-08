@@ -667,23 +667,37 @@ void MagmaTubeMap::assign_salvage_tubes()
     // A cell needs salvage if it has no entry in m_cell_pair_index (completely
     // unassigned) OR if it has existing pairs but some layers are uncovered.
     std::vector<TriangleCell> candidates;
+    int completely_unassigned = 0;
+    int partially_uncovered = 0;
     for (const auto &[cell, presence] : m_cells) {
         auto it = m_cell_pair_index.find(cell);
         if (it == m_cell_pair_index.end()) {
             // Completely unassigned
             candidates.push_back(cell);
+            ++completely_unassigned;
         } else {
             // Check if there are uncovered layers
             CellPresence uc = uncovered_presence(presence, it->second, m_pairs);
-            if (uc.first_layer <= uc.last_layer)
+            if (uc.first_layer <= uc.last_layer) {
                 candidates.push_back(cell);
+                ++partially_uncovered;
+            }
         }
     }
+
+    BOOST_LOG_TRIVIAL(info) << "Magma salvage: " << candidates.size() << " candidates ("
+        << completely_unassigned << " unassigned, " << partially_uncovered << " partially uncovered) from "
+        << m_cells.size() << " total cells, min_height=" << m_min_tube_height_layers << "L";
 
     std::sort(candidates.begin(), candidates.end(),
         [this](const TriangleCell &a, const TriangleCell &b) {
             return m_cells.at(a).first_layer < m_cells.at(b).first_layer;
         });
+
+    int salvage_created = 0;
+    int skip_already_covered = 0;
+    int skip_no_neighbors = 0;
+    int skip_too_short = 0;
 
     for (const TriangleCell &cell : candidates) {
         const CellPresence &presence = m_cells.at(cell);
@@ -695,19 +709,31 @@ void MagmaTubeMap::assign_salvage_tubes()
             cell_pairs = cell_idx_it->second;
 
         CellPresence cell_uncovered = uncovered_presence(presence, cell_pairs, m_pairs);
-        if (cell_uncovered.first_layer > cell_uncovered.last_layer)
+        if (cell_uncovered.first_layer > cell_uncovered.last_layer) {
+            ++skip_already_covered;
             continue;  // Fully covered (may have been paired by earlier iteration)
+        }
+
+        int uncovered_height = cell_uncovered.last_layer - cell_uncovered.first_layer + 1;
 
         // Try all 3 neighbors, prefer longest shared uncovered height
         TriangleCell best_partner;
         int best_height = 0;
         SharedSpan best_span{-1, -1};
 
+        int neighbors_missing = 0;
+        int neighbors_covered = 0;
+        int neighbors_too_short = 0;
+        int neighbors_checked = 0;
+
         for (const TriangleCell &neighbor : cell.neighbors()) {
             // Skip if not present in cell map
             auto nit = m_cells.find(neighbor);
-            if (nit == m_cells.end())
+            if (nit == m_cells.end()) {
+                ++neighbors_missing;
                 continue;
+            }
+            ++neighbors_checked;
 
             const CellPresence &neighbor_presence = nit->second;
 
@@ -718,20 +744,26 @@ void MagmaTubeMap::assign_salvage_tubes()
                 nbr_pairs = nbr_idx_it->second;
 
             CellPresence nbr_uncovered = uncovered_presence(neighbor_presence, nbr_pairs, m_pairs);
-            if (nbr_uncovered.first_layer > nbr_uncovered.last_layer)
+            if (nbr_uncovered.first_layer > nbr_uncovered.last_layer) {
+                ++neighbors_covered;
                 continue;  // Neighbor fully covered
+            }
 
             // Find shared spans within uncovered ranges
             std::vector<SharedSpan> spans = find_shared_spans(cell_uncovered, nbr_uncovered);
 
+            bool any_tall_enough = false;
             for (const SharedSpan &span : spans) {
                 int height = span.end - span.start + 1;
                 if (height >= m_min_tube_height_layers && height > best_height) {
                     best_partner = neighbor;
                     best_height = height;
                     best_span = span;
+                    any_tall_enough = true;
                 }
             }
+            if (!any_tall_enough)
+                ++neighbors_too_short;
         }
 
         if (best_height > 0) {
@@ -750,12 +782,23 @@ void MagmaTubeMap::assign_salvage_tubes()
             m_pairs.push_back(pair);
             m_cell_pair_index[cell].push_back(pair_idx);
             m_cell_pair_index[best_partner].push_back(pair_idx);
+            ++salvage_created;
         } else {
             // No partner found — mark as solid fill (empty vector)
             if (m_cell_pair_index.find(cell) == m_cell_pair_index.end())
                 m_cell_pair_index[cell];  // default-inserts empty vector
+
+            if (neighbors_missing == 3)
+                ++skip_no_neighbors;
+            else
+                ++skip_too_short;
+
         }
     }
+
+    BOOST_LOG_TRIVIAL(info) << "Magma salvage results: " << salvage_created << " pairs created, "
+        << skip_already_covered << " already covered, " << skip_no_neighbors << " no neighbors, "
+        << skip_too_short << " too short (min=" << m_min_tube_height_layers << "L)";
 }
 
 // ============================================================================

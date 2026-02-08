@@ -686,6 +686,8 @@ void PrintObject::infill()
                 m_print->set_status(36, L("Building Magma tube map"));
                 m_magma_tube_map = magma::MagmaTubeMap::build(
                     m_layers, *magma_cfg, m_print->config(), this->config());
+            } else {
+                m_magma_tube_map.reset();
             }
         }
 

@@ -3057,6 +3057,9 @@ void GLCanvas3D::load_gcode_preview(const GCodeProcessorResult& gcode_result, co
         wxGetApp().get_mode(), only_gcode);
     m_gcode_layers_times_cache = m_gcode_viewer.get_layers_times();
 
+    // Zone boundary: Reload shell meshes so they reflect current settings
+    m_gcode_viewer.load_zone_shells(*this->fff_print());
+
     m_gcode_viewer.get_moves_slider()->SetHigherValue(m_gcode_viewer.get_moves_slider()->GetMaxValue());
 
     if (wxGetApp().is_editor()) {
