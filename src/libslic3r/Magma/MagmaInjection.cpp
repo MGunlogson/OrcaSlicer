@@ -4,8 +4,8 @@
 
 #include "../GCode.hpp"
 #include "../GCode/GCodeProcessor.hpp"
-#include "../MultiPoint.hpp"
 #include "../Print.hpp"
+#include "../ShortestPath.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -46,35 +46,20 @@ std::vector<InjectionPoint> collect_injection_points(
         points.push_back(pt);
     }
 
-    // Serpentine sort for minimal travel: sort by Y rows, alternate X direction.
-    // Points on a triangle lattice naturally form rows; serpentine avoids the
-    // long return sweep that a pure left-to-right raster would require.
-    std::sort(points.begin(), points.end(), [](const InjectionPoint& a, const InjectionPoint& b) {
-        if (std::abs(a.position.y() - b.position.y()) > 0.5)
-            return a.position.y() < b.position.y();
-        return a.position.x() < b.position.x();
-    });
-
-    // Assign row indices based on Y proximity, then reverse even rows
+    // Order injection points for minimal travel using OrcaSlicer's greedy
+    // TSP solver (KD-tree backed).  Much better than a raster sweep for
+    // irregular point distributions near model boundaries.
     if (points.size() > 1) {
-        int row = 0;
-        for (size_t i = 1; i < points.size(); ++i) {
-            if (std::abs(points[i].position.y() - points[i - 1].position.y()) > 0.5)
-                ++row;
-        }
-        // Re-walk and reverse alternating rows in-place
-        size_t row_start = 0;
-        row = 0;
-        for (size_t i = 1; i <= points.size(); ++i) {
-            bool end_of_row = (i == points.size()) ||
-                              (std::abs(points[i].position.y() - points[i - 1].position.y()) > 0.5);
-            if (end_of_row) {
-                if (row % 2 == 1)
-                    std::reverse(points.begin() + row_start, points.begin() + i);
-                row_start = i;
-                ++row;
-            }
-        }
+        Points scaled_pts;
+        scaled_pts.reserve(points.size());
+        for (const auto& pt : points)
+            scaled_pts.push_back(Point(scale_(pt.position.x()), scale_(pt.position.y())));
+        std::vector<size_t> order = chain_points(scaled_pts);
+        std::vector<InjectionPoint> ordered;
+        ordered.reserve(points.size());
+        for (size_t idx : order)
+            ordered.push_back(std::move(points[idx]));
+        points = std::move(ordered);
     }
 
     return points;
@@ -354,7 +339,7 @@ std::string generate_injection_gcode(
         if (config.ironing_type.value != IroningType::NoIroning) {
             ir_flow_pct = config.ironing_flow.value / 100.0;
             ir_spacing  = config.ironing_spacing.value;
-            ir_speed    = config.ironing_speed.value;
+            ir_speed    = config.ironing_speed.value * 60.0;  // mm/s → mm/min
         }
 
         float nozzle_d = config.nozzle_diameter.get_at(extruder_id);
