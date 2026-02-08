@@ -626,12 +626,26 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, co
         toggle_field("infill_anchor", has_infill_anchors);
     }
 
+    // Magma Triangle: hide standard settings that don't apply.
+    // Magma density is fixed by cell geometry (magma_interior_width + line_width),
+    // lattice is orientation-fixed, no rotation/multiline/combination.
+    bool is_magma = pattern == ipMagmaTriangle;
+    if (have_infill && is_magma) {
+        toggle_line("sparse_infill_density", false);
+        toggle_line("infill_direction", false);
+        toggle_line("sparse_infill_rotate_template", false);
+        toggle_line("fill_multiline", false);
+        toggle_line("infill_combination", false);
+        toggle_line("infill_combination_max_layer_height", false);
+        toggle_line("symmetric_infill_y_axis", false);
+    }
+
     //cross zag
     bool is_cross_zag = config->option<ConfigOptionEnum<InfillPattern>>("sparse_infill_pattern")->value == InfillPattern::ipCrossZag;
     bool is_locked_zig = config->option<ConfigOptionEnum<InfillPattern>>("sparse_infill_pattern")->value == InfillPattern::ipLockedZag;
 
     toggle_line("infill_shift_step", is_cross_zag || is_locked_zig);
-    
+
     for (auto el : { "skeleton_infill_density", "skin_infill_density", "infill_lock_depth", "skin_infill_depth","skin_infill_line_width", "skeleton_infill_line_width" })
         toggle_line(el, is_locked_zig);
 

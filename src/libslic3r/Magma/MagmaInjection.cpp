@@ -4,10 +4,12 @@
 
 #include "../GCode.hpp"
 #include "../GCode/GCodeProcessor.hpp"
+#include "../MultiPoint.hpp"
 #include "../Print.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <sstream>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -37,6 +39,10 @@ std::vector<InjectionPoint> collect_injection_points(
         pt.position   = lattice.cell_center(pair.cell_a);
         pt.volume_mm3 = pair.volume_mm3;
         pt.pair_index = i;
+        pt.start_layer = pair.pair_start_layer;
+        // Window center: halfway through the window gap region at the tube bottom
+        int wh = tube_map.window_height_layers();
+        pt.window_center_layer = pair.pair_start_layer + wh / 2;
         points.push_back(pt);
     }
 
@@ -72,6 +78,84 @@ std::vector<InjectionPoint> collect_injection_points(
     }
 
     return points;
+}
+
+// Generate the spiral-following center-line of a U-tube and simplify with
+// Douglas-Peucker.  Returns waypoints tracing: top of cell_a → descent →
+// window crossing → ascent → top of cell_b.
+static std::vector<Vec3d> build_tube_viz_waypoints(
+    const MagmaTubeMap& tube_map,
+    const UTubePair& pair,
+    double layer_z,         // Z at pair_end_layer
+    int    window_center_layer,
+    double first_layer_height,
+    double layer_height)
+{
+    const auto& sp = tube_map.spiral_params();
+    double cs = tube_map.cell_spacing();
+    float  iw = tube_map.interior_width();
+
+    // Helper: Z height for a given layer index
+    auto z_for_layer = [&](int L) -> double {
+        return first_layer_height + (L > 0 ? (L - 1) * layer_height + layer_height : 0);
+    };
+
+    // Z offsets: raise tube bottom so rendered cylinder doesn't poke through floor
+    double z_bot_raw = z_for_layer(pair.pair_start_layer);
+    double z_bot = z_bot_raw + iw / 2.0;  // sit ON the floor
+    double z_window = z_for_layer(window_center_layer);
+    // Clamp window Z above the raised bottom
+    if (z_window < z_bot)
+        z_window = z_bot;
+
+    std::vector<Vec3d> full_path;
+
+    // Phase 1: Descend through cell A (top → window center)
+    for (int L = pair.pair_end_layer; L >= window_center_layer; --L) {
+        TriangleLattice lat = lattice_for_layer(cs, sp, L);
+        Vec2d c = lat.cell_center(pair.cell_a);
+        double z = (L == pair.pair_end_layer) ? layer_z :
+                   (L <= window_center_layer) ? z_window :
+                   std::max(z_for_layer(L), z_bot);
+        full_path.push_back({c.x(), c.y(), z});
+    }
+
+    // Phase 2: Cross to cell B at window center Z
+    {
+        TriangleLattice lat = lattice_for_layer(cs, sp, window_center_layer);
+        Vec2d c = lat.cell_center(pair.cell_b);
+        full_path.push_back({c.x(), c.y(), z_window});
+    }
+
+    // Phase 3: Ascend through cell B (window center → top)
+    for (int L = window_center_layer + 1; L <= pair.pair_end_layer; ++L) {
+        TriangleLattice lat = lattice_for_layer(cs, sp, L);
+        Vec2d c = lat.cell_center(pair.cell_b);
+        double z = (L == pair.pair_end_layer) ? layer_z :
+                   std::max(z_for_layer(L), z_bot);
+        full_path.push_back({c.x(), c.y(), z});
+    }
+
+    // Return full-resolution path (one point per layer per phase).
+    // With ~12-120 points per tube and ~1500 tubes, total vertex count
+    // is manageable (~20-40K) and the layer-by-layer spiral renders smoothly.
+    return full_path;
+}
+
+// Format waypoints as a MAGMA_TUBE G-code comment.
+static std::string format_tube_viz_comment(const std::vector<Vec3d>& waypoints, float width)
+{
+    std::ostringstream oss;
+    oss << "; MAGMA_TUBE n=" << waypoints.size() << " w=" << width << " pts=";
+    for (size_t i = 0; i < waypoints.size(); ++i) {
+        if (i > 0) oss << ';';
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.3f,%.3f,%.3f",
+                 waypoints[i].x(), waypoints[i].y(), waypoints[i].z());
+        oss << buf;
+    }
+    oss << '\n';
+    return oss.str();
 }
 
 std::string generate_injection_gcode(
@@ -168,23 +252,10 @@ std::string generate_injection_gcode(
     }
 
     // --- Injection loop ---
-    // Emit role tag for GCode processor
-    sprintf(buf, ";%s%s\n",
-            GCodeProcessor::reserved_tag(GCodeProcessor::ETags::Role).c_str(),
-            ExtrusionEntity::role_to_string(erMagmaInjection).c_str());
-    gcode += buf;
-
-    // Force display dimensions for stationary injection extrusion
-    float display_width = tube_map.interior_width();
-    float display_height = static_cast<float>(config.layer_height.value);
-    sprintf(buf, ";%s%g\n",
-            GCodeProcessor::reserved_tag(GCodeProcessor::ETags::Height).c_str(),
-            display_height);
-    gcode += buf;
-    sprintf(buf, ";%s%g\n",
-            GCodeProcessor::reserved_tag(GCodeProcessor::ETags::Width).c_str(),
-            display_width);
-    gcode += buf;
+    // Config values needed for visualization waypoints
+    float display_dim = tube_map.interior_width();
+    double first_layer_height = config.initial_layer_print_height.value;
+    double lh = config.layer_height.value;
 
     constexpr double slam_depth = 0.1;  // mm, hardcoded for safety
 
@@ -193,17 +264,44 @@ std::string generate_injection_gcode(
         if (volume <= 0)
             continue;
 
-        // Travel to injection point
+        // Travel to injection point (before role tag so unretract classifies correctly)
         Point scaled_pos(scale_(pt.position.x()), scale_(pt.position.y()));
         gcode += gcodegen.travel_to(scaled_pos, erMagmaInjection, "move to injection point");
 
-        // Unretract before injection
+        // Unretract before injection — happens before the role tag so the
+        // GCodeProcessor sees this as a normal Unretract, not an Extrude.
         gcode += gcodegen.unretract();
 
         // Z-slam: lower nozzle into surface to seal against hole
         if (z_slam) {
             sprintf(buf, "G1 Z%.3f F600 ; z-slam seal\n", layer_z - slam_depth);
             gcode += buf;
+        }
+
+        // Set role and display dimensions for this injection.
+        // Emitted per-injection (after unretract) so that only the actual
+        // injection extrusion is classified as erMagmaInjection.
+        sprintf(buf, ";%s%s\n",
+                GCodeProcessor::reserved_tag(GCodeProcessor::ETags::Role).c_str(),
+                ExtrusionEntity::role_to_string(erMagmaInjection).c_str());
+        gcode += buf;
+        sprintf(buf, ";%s%g\n",
+                GCodeProcessor::reserved_tag(GCodeProcessor::ETags::Height).c_str(),
+                display_dim);
+        gcode += buf;
+        sprintf(buf, ";%s%g\n",
+                GCodeProcessor::reserved_tag(GCodeProcessor::ETags::Width).c_str(),
+                display_dim);
+        gcode += buf;
+
+        // Emit tube visualization metadata for GCodeProcessor
+        {
+            const auto& pair = tube_map.u_tube_pairs()[pt.pair_index];
+            auto waypoints = build_tube_viz_waypoints(
+                tube_map, pair, layer_z, pt.window_center_layer,
+                first_layer_height, lh);
+            if (!waypoints.empty())
+                gcode += format_tube_viz_comment(waypoints, tube_map.interior_width());
         }
 
         // Stationary extrude (E-only, no XY movement)

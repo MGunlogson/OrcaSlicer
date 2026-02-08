@@ -19,6 +19,8 @@ struct InjectionPoint {
     Vec2d  position;      // XY center of injection cell (mm, unscaled)
     double volume_mm3;    // volume to inject (after fill_factor)
     int    pair_index;    // index into tube map pairs
+    int    start_layer;   // pair_start_layer (for computing z_bot)
+    int    window_center_layer;  // center layer of window gap (for visualization)
 };
 
 // Collect injection points for tubes whose cap layer == layer_id.

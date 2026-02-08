@@ -131,7 +131,7 @@ std::unique_ptr<MagmaTubeMap> MagmaTubeMap::build(
 
     // Spiral params
     bool spiral_enabled = config.magma_spiral_interlock.value;
-    map->m_spiral_params = compute_spiral_params(map->m_interior_width, map->m_line_width, spiral_enabled);
+    map->m_spiral_params = compute_spiral_params(map->m_interior_width, map->m_line_width, map->m_layer_height, spiral_enabled);
 
     // Window spec (handles window height and stagger; tube height may be overridden below)
     map->m_window_spec = WindowSpec::from_config(

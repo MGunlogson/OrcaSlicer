@@ -776,6 +776,18 @@ class Print;
         float m_fan_speed; // percentage
         float m_z_offset; // mm
         ExtrusionRole m_extrusion_role;
+
+        // Pending tube visualization data parsed from ; MAGMA_TUBE comments.
+        // When active, the next erMagmaInjection Extrude is replaced with
+        // synthetic vertices tracing the U-tube spiral path.
+        struct PendingTubeViz {
+            std::vector<Vec3f> waypoints;
+            float width = 0.f;
+            bool  active = false;
+            void reset() { waypoints.clear(); width = 0.f; active = false; }
+        };
+        PendingTubeViz m_pending_tube_viz;
+
         std::vector<int> m_filament_maps;
         std::vector<unsigned char> m_last_filament_id;
         std::vector<unsigned char> m_filament_id;

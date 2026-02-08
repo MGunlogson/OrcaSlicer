@@ -5096,6 +5096,11 @@ LayerResult GCode::process_layer(
                         if (!injection_points.empty()) {
                             gcode += magma::generate_injection_gcode(
                                 *this, *tube_map, injection_points, m_layer->print_z);
+                            // Injection emits its own ;TYPE: tags via raw comments,
+                            // bypassing m_last_processor_extrusion_role tracking.
+                            // Force the next extrusion to re-emit its TYPE tag by
+                            // setting the tracker to a role no normal path will match.
+                            m_last_processor_extrusion_role = erMagmaInjection;
                         }
                     }
                 }

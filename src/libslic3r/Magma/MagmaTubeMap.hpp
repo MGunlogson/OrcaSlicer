@@ -98,8 +98,10 @@ public:
     double cell_spacing() const { return m_cell_spacing; }
     float  interior_width() const { return m_interior_width; }
 
-    // For injection G-code (future)
+    // For injection G-code and visualization
     const std::vector<UTubePair>& u_tube_pairs() const { return m_pairs; }
+    float layer_height() const { return m_layer_height; }
+    int   window_height_layers() const { return m_window_spec.window_height_layers; }
 
     // Statistics for debug logging
     int num_cells() const { return static_cast<int>(m_cells.size()); }

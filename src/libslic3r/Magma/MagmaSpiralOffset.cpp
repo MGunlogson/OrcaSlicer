@@ -6,7 +6,7 @@
 namespace Slic3r {
 namespace magma {
 
-SpiralParams compute_spiral_params(float interior_width, float line_width, bool enabled)
+SpiralParams compute_spiral_params(float interior_width, float line_width, float layer_height, bool enabled)
 {
     SpiralParams params;
     params.enabled = enabled;
@@ -25,8 +25,16 @@ SpiralParams compute_spiral_params(float interior_width, float line_width, bool 
     constexpr float target_tube_overlap = 0.75f;
     const float max_disp_tube = (1.0f - target_tube_overlap) * interior_width;
 
-    // Use the more restrictive constraint
-    const float max_displacement = std::min(max_disp_line, max_disp_tube);
+    // Constraint 3: Maximum helix angle for injection flow.
+    // At low layer heights the per-layer geometric constraints allow the same
+    // horizontal displacement as at thick layers, but over much less vertical
+    // distance, producing a steep helix that resists injection flow.  Cap so
+    // the helix angle never exceeds 45° (tan(45°) = 1.0).
+    constexpr float MAX_HELIX_TAN = 1.0f;   // tan(45°)
+    const float max_disp_helix = MAX_HELIX_TAN * layer_height;
+
+    // Use the most restrictive constraint
+    const float max_displacement = std::min({max_disp_line, max_disp_tube, max_disp_helix});
 
     // Interlock constraint: swept circles of adjacent tubes should touch
     const float cell_spacing = static_cast<float>(cell_spacing_from_geometry(interior_width, line_width));

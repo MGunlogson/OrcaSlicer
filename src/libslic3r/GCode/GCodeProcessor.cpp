@@ -2974,6 +2974,48 @@ void GCodeProcessor::process_tags(const std::string_view comment, bool producers
         return;
     }
 
+    // Magma tube visualization metadata
+    {
+        // Comment arrives as " MAGMA_TUBE ..." (with leading space from G-code "; MAGMA_TUBE ...")
+        auto trimmed = comment;
+        while (!trimmed.empty() && trimmed.front() == ' ')
+            trimmed.remove_prefix(1);
+        if (boost::starts_with(trimmed, "MAGMA_TUBE ")) {
+            m_pending_tube_viz.reset();
+            // Parse: n=<int> w=<float> pts=x,y,z;x,y,z;...
+            auto data = trimmed.substr(11);  // skip "MAGMA_TUBE "
+            float w = 0.f;
+            int n = 0;
+            // Extract n= and w=
+            if (auto pos = data.find("n="); pos != std::string_view::npos) {
+                n = std::atoi(data.data() + pos + 2);
+            }
+            if (auto pos = data.find("w="); pos != std::string_view::npos) {
+                w = static_cast<float>(std::atof(data.data() + pos + 2));
+            }
+            m_pending_tube_viz.width = w;
+            // Extract pts=
+            if (auto pos = data.find("pts="); pos != std::string_view::npos) {
+                auto pts_str = data.substr(pos + 4);
+                m_pending_tube_viz.waypoints.reserve(n > 0 ? n : 20);
+                size_t start = 0;
+                while (start < pts_str.size()) {
+                    float x = 0, y = 0, z = 0;
+                    if (std::sscanf(pts_str.data() + start, "%f,%f,%f", &x, &y, &z) == 3) {
+                        m_pending_tube_viz.waypoints.push_back(Vec3f(x, y, z));
+                    }
+                    // Advance past this point (find next ';' or end)
+                    auto semi = pts_str.find(';', start);
+                    if (semi == std::string_view::npos)
+                        break;
+                    start = semi + 1;
+                }
+            }
+            m_pending_tube_viz.active = !m_pending_tube_viz.waypoints.empty();
+            return;
+        }
+    }
+
     // ; OBJECT_ID  start
     if (boost::starts_with(comment, " start printing object")) {
         m_object_label_id = get_object_label_id(comment);
@@ -3688,8 +3730,10 @@ void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes
         else if (delta_pos[E] > 0.0f) {
             if (delta_pos[X] == 0.0f && delta_pos[Y] == 0.0f) {
                 if (delta_pos[Z] == 0.0f) {
-                    // Magma injection: stationary extrude is real extrusion, not unretract
-                    if (m_extrusion_role == erMagmaInjection)
+                    // Magma injection: stationary extrude is real extrusion, not unretract.
+                    // Use pending tube viz flag (set by MAGMA_TUBE comment) rather than role,
+                    // so unretracts between injections classify correctly.
+                    if (m_extrusion_role == erMagmaInjection && m_pending_tube_viz.active)
                         return EMoveType::Extrude;
                     return EMoveType::Unretract;
                 }
@@ -5413,6 +5457,88 @@ void GCodeProcessor::process_filament_change(int id)
 
 void GCodeProcessor::store_move_vertex(EMoveType type, EMovePathType path_type, bool internal_only)
 {
+    // Intercept Magma injection extrusions when tube viz data is pending.
+    // Replace the single stationary extrusion with synthetic vertices
+    // tracing the U-tube spiral path for preview rendering.
+    if (m_pending_tube_viz.active &&
+        type == EMoveType::Extrude &&
+        m_extrusion_role == erMagmaInjection) {
+
+        int filament_id = get_filament_id();
+        m_last_line_id = m_line_id;
+
+        float total_e = static_cast<float>(m_end_position[E] - m_start_position[E]);
+
+        // Waypoints are in lattice/model space.  The nozzle is currently at
+        // the injection point which corresponds to waypoints[0] in model
+        // space but m_end_position in G-code space.  Compute the delta to
+        // translate all waypoints from model → viewer coordinates.
+        // Normal vertex position formula (from store_move_vertex below):
+        //   Vec3f(m_end_position[X] + m_x_offset, m_end_position[Y] + m_y_offset,
+        //         m_end_position[Z] - m_z_offset) + m_extruder_offsets[filament_id]
+        float dx = static_cast<float>(m_end_position[X]) + static_cast<float>(m_x_offset)
+                   - m_pending_tube_viz.waypoints[0].x();
+        float dy = static_cast<float>(m_end_position[Y]) + static_cast<float>(m_y_offset)
+                   - m_pending_tube_viz.waypoints[0].y();
+        // Z offset: waypoint Z values are in model space (absolute Z from bed),
+        // same coordinate space as normal extrusion Z.  Only subtract
+        // m_z_offset (typically 0) to match the render-space convention.
+        // Do NOT use m_end_position[Z] here — it may be z-slammed during
+        // injection, but the tube geometry lives at the real layer heights.
+        float dz = -static_cast<float>(m_z_offset);
+
+        // Compute total path length for proportional E distribution
+        double total_len = 0;
+        for (size_t i = 1; i < m_pending_tube_viz.waypoints.size(); ++i)
+            total_len += (m_pending_tube_viz.waypoints[i] - m_pending_tube_viz.waypoints[i - 1]).norm();
+
+        // Compute mm3_per_mm for tube cross-section visualization.
+        // Stationary extrusion has m_mm3_per_mm=0, but the renderer uses this
+        // for volumetric rate coloring.  Use circular tube cross-section area.
+        float tube_w = m_pending_tube_viz.width;
+        float tube_mm3_per_mm = static_cast<float>(M_PI / 4.0) * tube_w * tube_w;
+
+        for (size_t i = 0; i < m_pending_tube_viz.waypoints.size(); ++i) {
+            float seg_e = 0.f;
+            if (i > 0 && total_len > 0) {
+                float seg_len = (m_pending_tube_viz.waypoints[i] - m_pending_tube_viz.waypoints[i - 1]).norm();
+                seg_e = total_e * (seg_len / static_cast<float>(total_len));
+            }
+
+            Vec3f pos(m_pending_tube_viz.waypoints[i].x() + dx,
+                      m_pending_tube_viz.waypoints[i].y() + dy,
+                      m_pending_tube_viz.waypoints[i].z() + dz);
+
+            m_result.moves.push_back({
+                m_last_line_id,
+                EMoveType::Extrude,
+                erMagmaInjection,
+                static_cast<unsigned char>(filament_id),
+                m_cp_color.current,
+                pos + m_extruder_offsets[filament_id],
+                seg_e,
+                m_feedrate,
+                0.0f,
+                tube_w,                             // width: circular cross-section
+                tube_w,                             // height == width
+                tube_mm3_per_mm,
+                0.0f,                               // travel_dist
+                m_fan_speed,
+                m_extruder_temps[filament_id],
+                { 0.0f, 0.0f },
+                static_cast<float>(m_layer_id),
+                std::max<unsigned int>(1, m_layer_id) - 1,
+                internal_only,
+                m_object_label_id,
+                m_print_z
+            });
+        }
+
+        m_pending_tube_viz.reset();
+        // Do NOT update m_end_position — processor continues from real nozzle position
+        return;
+    }
+
     int filament_id = get_filament_id();
     m_last_line_id = (type == EMoveType::Color_change || type == EMoveType::Pause_Print || type == EMoveType::Custom_GCode) ?
         m_line_id + 1 :

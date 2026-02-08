@@ -16,8 +16,9 @@ struct SpiralParams {
 // Compute spiral parameters once per object from config values.
 // interior_width: effective interior width (mm)
 // line_width: extrusion line width (mm)
+// layer_height: nominal layer height (mm), used to cap helix angle
 // enabled: whether spiral interlock is enabled
-SpiralParams compute_spiral_params(float interior_width, float line_width, bool enabled);
+SpiralParams compute_spiral_params(float interior_width, float line_width, float layer_height, bool enabled);
 
 // Compute per-layer (x,y) offset in mm.
 Vec2d compute_spiral_offset(const SpiralParams &params, int layer_id);

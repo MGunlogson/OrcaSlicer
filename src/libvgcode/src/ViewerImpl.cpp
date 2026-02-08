@@ -910,8 +910,10 @@ void ViewerImpl::reset()
 // On some graphic cards texture buffers using GL_RGB32F format do not work, see:
 // https://dev.prusa3d.com/browse/SPE-2411
 // https://github.com/prusa3d/PrusaSlicer/issues/12908
-// To let all drivers be happy, we use GL_RGBA32F format, so we need to add an extra (currently unused) float
-// to position and heights_widths_angles vectors
+// To let all drivers be happy, we use GL_RGBA32F format which gives us 4 floats per
+// entry.  The 4th float of heights_widths_angles stores the parallel-transported
+// frame angle for near-vertical segments (used by the shader for seamless junction
+// rendering).  The 4th float of positions is unused (padding only).
 using Vec4 = std::array<float, 4>;
 
 static void extract_pos_and_or_hwa(const std::vector<PathVertex>& vertices, float travels_radius, float wipes_radius, BitSet<>& valid_lines_bitset,
@@ -928,6 +930,15 @@ static void extract_pos_and_or_hwa(const std::vector<PathVertex>& vertices, floa
         positions->reserve(vertices.size());
     if (heights_widths_angles != nullptr)
         heights_widths_angles->reserve(vertices.size());
+
+    // Track parallel-transported frame for near-vertical paths.
+    // At each vertex in a near-vertical sequence, the transported right vector
+    // is projected perpendicular to the local line direction and its XY angle
+    // is stored in the 4th component.  The shader reads this per-endpoint,
+    // ensuring both sides of each junction share the same orientation.
+    Vec3 transported_right = { 0.0f, -1.0f, 0.0f };
+    bool in_near_vertical_seq = false;
+
     for (size_t i = 0; i < vertices.size(); ++i) {
         const PathVertex& v = vertices[i];
         const EMoveType move_type = v.type;
@@ -973,9 +984,83 @@ static void extract_pos_and_or_hwa(const std::vector<PathVertex>& vertices, floa
                 height = v.height;
                 width = v.width;
             }
-            // the last component is a dummy float to comply with GL_RGBA32F format
-            heights_widths_angles->push_back({ height, width,
-                std::atan2(prev_line[0] * this_line[1] - prev_line[1] * this_line[0], dot(prev_line, this_line)), 0.0f });
+            // Compute junction angle between consecutive segments.
+            // Use the full 3D cross product magnitude for the sine term so that
+            // nearly-vertical segments (tubes) get correct miter joints.
+            // The sign comes from the Z component of the cross product (the 2D
+            // cross product) which gives the turn direction in the XY plane.
+            float junction_angle = 0.0f;
+            {
+                const float cx = prev_line[1] * this_line[2] - prev_line[2] * this_line[1];
+                const float cy = prev_line[2] * this_line[0] - prev_line[0] * this_line[2];
+                const float cz = prev_line[0] * this_line[1] - prev_line[1] * this_line[0];
+                const float cross_mag = std::sqrt(cx * cx + cy * cy + cz * cz);
+                const float signed_cross = (cz >= 0.0f) ? cross_mag : -cross_mag;
+                junction_angle = std::atan2(signed_cross, dot(prev_line, this_line));
+            }
+
+            // Compute per-vertex frame angle for near-vertical segments.
+            // Parallel transport maintains a consistent cross-section frame along
+            // near-vertical paths.  Both sides of each segment junction read from
+            // the shared vertex -> same angle -> seamless face connection.
+            float frame_angle = 0.0f;
+            {
+                bool this_vertex_nv = false;
+                Vec3 transport_dir = ZERO;
+
+                // Check incoming segment
+                if (prev_line_valid) {
+                    const float plen = length(prev_line);
+                    if (plen > 1e-4f) {
+                        const Vec3 pd = { prev_line[0] / plen, prev_line[1] / plen, prev_line[2] / plen };
+                        if (std::abs(pd[2]) > 0.9f) {
+                            this_vertex_nv = true;
+                            transport_dir = pd;
+                        }
+                    }
+                }
+                // Fallback to outgoing segment
+                if (!this_vertex_nv && this_line_valid) {
+                    const float tlen = length(this_line);
+                    if (tlen > 1e-4f) {
+                        const Vec3 td = { this_line[0] / tlen, this_line[1] / tlen, this_line[2] / tlen };
+                        if (std::abs(td[2]) > 0.9f) {
+                            this_vertex_nv = true;
+                            transport_dir = td;
+                        }
+                    }
+                }
+
+                if (this_vertex_nv) {
+                    if (!in_near_vertical_seq) {
+                        transported_right = { 0.0f, -1.0f, 0.0f };
+                        in_near_vertical_seq = true;
+                    }
+                    // Project right onto plane perpendicular to transport direction
+                    const float d = dot(transported_right, transport_dir);
+                    const Vec3 projected = {
+                        transported_right[0] - d * transport_dir[0],
+                        transported_right[1] - d * transport_dir[1],
+                        transported_right[2] - d * transport_dir[2]
+                    };
+                    const float proj_len = length(projected);
+                    if (proj_len > 1e-6f) {
+                        transported_right = {
+                            projected[0] / proj_len,
+                            projected[1] / proj_len,
+                            projected[2] / proj_len
+                        };
+                    }
+                    // Store absolute XY angle: shader reconstructs as
+                    // line_right_dir = vec3(-sin(theta), -cos(theta), 0.0)
+                    frame_angle = std::atan2(-transported_right[0], -transported_right[1]);
+                }
+                else {
+                    in_near_vertical_seq = false;
+                }
+            }
+
+            heights_widths_angles->push_back({ height, width, junction_angle, frame_angle });
         }
     }
 }
