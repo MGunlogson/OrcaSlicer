@@ -626,12 +626,26 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, co
         toggle_field("infill_anchor", has_infill_anchors);
     }
 
+    // Magma Triangle: hide standard settings that don't apply.
+    // Magma density is fixed by cell geometry (magma_interior_width + line_width),
+    // lattice is orientation-fixed, no rotation/multiline/combination.
+    bool is_magma = pattern == ipMagmaTriangle;
+    if (have_infill && is_magma) {
+        toggle_line("sparse_infill_density", false);
+        toggle_line("infill_direction", false);
+        toggle_line("sparse_infill_rotate_template", false);
+        toggle_line("fill_multiline", false);
+        toggle_line("infill_combination", false);
+        toggle_line("infill_combination_max_layer_height", false);
+        toggle_line("symmetric_infill_y_axis", false);
+    }
+
     //cross zag
     bool is_cross_zag = config->option<ConfigOptionEnum<InfillPattern>>("sparse_infill_pattern")->value == InfillPattern::ipCrossZag;
     bool is_locked_zig = config->option<ConfigOptionEnum<InfillPattern>>("sparse_infill_pattern")->value == InfillPattern::ipLockedZag;
 
     toggle_line("infill_shift_step", is_cross_zag || is_locked_zig);
-    
+
     for (auto el : { "skeleton_infill_density", "skin_infill_density", "infill_lock_depth", "skin_infill_depth","skin_infill_line_width", "skeleton_infill_line_width" })
         toggle_line(el, is_locked_zig);
 
@@ -872,6 +886,34 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, co
         "min_feature_size", "min_length_factor", "min_bead_width", "wall_distribution_count", "initial_layer_min_bead_width"})
         toggle_line(el, have_arachne);
     toggle_field("detect_thin_wall", !have_arachne);
+
+    // Dual infill zones settings
+    bool have_dual_infill = config->opt_bool("dual_infill_enabled");
+    for (auto el : { "dual_infill_outer_width", "dual_infill_shell_walls",
+        "dual_infill_shell_width", "dual_infill_min_inner_width",
+        "dual_infill_solid_layers", "dual_infill_solid_thickness" })
+        toggle_line(el, have_dual_infill);
+
+    // Magma settings — visible when Magma Triangle pattern is selected or dual infill is enabled
+    // (dual infill uses Magma Triangle pattern in outer zone regardless of sparse_infill_pattern)
+    bool is_magma_infill = config->opt_enum<InfillPattern>("sparse_infill_pattern") == ipMagmaTriangle;
+    bool have_magma_pattern = is_magma_infill || have_dual_infill;
+
+    // Magma Pattern section
+    for (auto el : { "magma_spiral_interlock", "magma_interior_width" })
+        toggle_line(el, have_magma_pattern);
+
+    // Magma Tubes section
+    for (auto el : { "magma_window_height", "magma_tube_height_layers",
+        "magma_tube_height", "magma_stagger_levels", "magma_fill_depth_factor",
+        "magma_tube_fill_factor" })
+        toggle_line(el, have_magma_pattern);
+
+    // Magma Injection section
+    for (auto el : { "magma_injection_temp", "magma_injection_speed", "magma_iron_tube_ends",
+        "magma_injection_park", "magma_injection_dwell", "magma_injection_z_slam",
+        "magma_injection_filament" })
+        toggle_line(el, have_magma_pattern);
 
     // Orca
     auto is_role_based_wipe_speed = config->opt_bool("role_based_wipe_speed");

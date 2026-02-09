@@ -4,6 +4,7 @@
 #include <memory>
 #include <libslic3r/TriangleMesh.hpp>
 #include <libslic3r/SLA/JobController.hpp>
+#include <libslic3r/SLA/Interior.hpp>
 
 namespace Slic3r {
 
@@ -18,12 +19,6 @@ struct HollowingConfig
 };
 
 enum HollowingFlags { hfRemoveInsideTriangles = 0x1 };
-
-// All data related to a generated mesh interior. Includes the 3D grid and mesh
-// and various metadata. No need to manipulate from outside.
-struct Interior;
-struct InteriorDeleter { void operator()(Interior *p); };
-using  InteriorPtr = std::unique_ptr<Interior, InteriorDeleter>;
 
 indexed_triangle_set &      get_mesh(Interior &interior);
 const indexed_triangle_set &get_mesh(const Interior &interior);

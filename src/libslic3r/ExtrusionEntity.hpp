@@ -37,6 +37,16 @@ enum ExtrusionRole : uint8_t {
     erSupportTransition,
     erWipeTower,
     erCustom,
+    // Dual infill zone outer infill (Magma Triangle U-tube pattern)
+    erZoneOuterInfill,
+    // Zone shell walls (perimeters between outer and inner zones)
+    erZoneShell,
+    // Zone floor (bottom of zone boundary, solid)
+    erZoneFloor,
+    // Zone ceiling (top of zone boundary, bridges over inner zone)
+    erZoneCeiling,
+    // Magma injection (stationary extrude to fill tubes with plastic)
+    erMagmaInjection,
     // Extrusion role for a collection with multiple extrusion roles.
     erMixed,
     erCount
@@ -78,7 +88,11 @@ inline bool is_infill(ExtrusionRole role)
         || role == erSolidInfill
         || role == erTopSolidInfill
         || role == erBottomSurface
-        || role == erIroning;
+        || role == erIroning
+        || role == erZoneOuterInfill
+        || role == erZoneShell
+        || role == erZoneFloor
+        || role == erZoneCeiling;
 }
 
 inline bool is_top_surface(ExtrusionRole role)
@@ -88,12 +102,25 @@ inline bool is_top_surface(ExtrusionRole role)
 
 inline bool is_solid_infill(ExtrusionRole role)
 {
+    // All zone roles are solid:
+    // - erZoneOuterInfill: U-tubes become solid after injection before next layer
+    // - erZoneShell, erZoneFloor, erZoneCeiling: solid fill surfaces
     return role == erBridgeInfill
         || role == erInternalBridgeInfill
         || role == erSolidInfill
         || role == erTopSolidInfill
         || role == erBottomSurface
-        || role == erIroning;
+        || role == erIroning
+        || role == erZoneOuterInfill
+        || role == erZoneShell
+        || role == erZoneFloor
+        || role == erZoneCeiling;
+}
+
+inline bool is_zone(ExtrusionRole role)
+{
+    return role == erZoneOuterInfill || role == erZoneShell || role == erZoneFloor || role == erZoneCeiling
+        || role == erMagmaInjection;
 }
 
 inline bool is_bridge(ExtrusionRole role) {

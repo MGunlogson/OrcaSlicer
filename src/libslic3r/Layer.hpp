@@ -26,6 +26,10 @@ namespace FillLightning {
     class Generator;
 };
 
+namespace magma {
+    class MagmaTubeMap;
+};
+
 class LayerRegion
 {
 public:
@@ -55,6 +59,10 @@ public:
     SurfaceCollection           fill_surfaces;
     // BBS: Unspecified fill polygons, used for interecting when we don't want the infill/perimeter overlap
     ExPolygons                  fill_no_overlap_expolygons;
+
+    // Dual infill zones: The inner zone region inside the boundary shell
+    // Used to clip floor/ceiling surfaces so they stay within the shell boundary
+    ExPolygons                  inner_zone;
 
     // collection of expolygons representing the bridged areas (thus not
     // needing support material)
@@ -156,6 +164,10 @@ public:
     // BBS
     ExPolygons              loverhangs;
     BoundingBox             loverhangs_bbox;
+
+    // Dual infill zones: Zone boundary from 3D shell computation
+    // Separates outer zone from inner zone
+    ExPolygons              zone_boundary;
     size_t                  region_count() const { return m_regions.size(); }
     const LayerRegion*      get_region(int idx) const { return m_regions[idx]; }
     LayerRegion*            get_region(int idx) { return m_regions[idx]; }
@@ -185,8 +197,10 @@ public:
     static bool             is_perimeter_compatible(const PrintRegion& a, const PrintRegion& b);
     void                    make_perimeters();
     // Phony version of make_fills() without parameters for Perl integration only.
-    void                    make_fills() { this->make_fills(nullptr, nullptr); }
-    void                    make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive::Octree* support_fill_octree, FillLightning::Generator* lightning_generator = nullptr);
+    void                    make_fills() { this->make_fills(nullptr, nullptr, nullptr, nullptr); }
+    void                    make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive::Octree* support_fill_octree,
+                                       FillLightning::Generator* lightning_generator = nullptr,
+                                       const magma::MagmaTubeMap* tube_map = nullptr);
     Polylines               generate_sparse_infill_polylines_for_anchoring(FillAdaptive::Octree *adaptive_fill_octree,
                                                                            FillAdaptive::Octree *support_fill_octree,
                                                                            FillLightning::Generator* lightning_generator) const;

@@ -2454,6 +2454,36 @@ void TabPrint::build()
         optgroup->append_single_option_line("filter_out_gap_fill", "strength_settings_infill#filter-out-tiny-gaps");
         optgroup->append_single_option_line("infill_wall_overlap", "strength_settings_infill#infill-wall-overlap");
 
+        optgroup = page->new_optgroup(L("Dual Infill Zones"), L"param_dual_infill");
+        optgroup->append_single_option_line("dual_infill_enabled");
+        optgroup->append_single_option_line("dual_infill_outer_width");
+        optgroup->append_single_option_line("dual_infill_shell_walls");
+        optgroup->append_single_option_line("dual_infill_shell_width");
+        optgroup->append_single_option_line("dual_infill_min_inner_width");
+        optgroup->append_single_option_line("dual_infill_solid_layers");
+        optgroup->append_single_option_line("dual_infill_solid_thickness");
+
+        optgroup = page->new_optgroup(L("Magma Pattern"), L"param_magmatriangle");
+        optgroup->append_single_option_line("magma_spiral_interlock");
+        optgroup->append_single_option_line("magma_interior_width");
+
+        optgroup = page->new_optgroup(L("Magma Tubes"), L"param_magmatubes");
+        optgroup->append_single_option_line("magma_window_height");
+        optgroup->append_single_option_line("magma_tube_height_layers");
+        optgroup->append_single_option_line("magma_tube_height");
+        optgroup->append_single_option_line("magma_stagger_levels");
+        optgroup->append_single_option_line("magma_fill_depth_factor");
+        optgroup->append_single_option_line("magma_tube_fill_factor");
+
+        optgroup = page->new_optgroup(L("Magma Injection"), L"param_magmainjection");
+        optgroup->append_single_option_line("magma_injection_temp");
+        optgroup->append_single_option_line("magma_injection_speed");
+        optgroup->append_single_option_line("magma_injection_dwell");
+        optgroup->append_single_option_line("magma_injection_z_slam");
+        optgroup->append_single_option_line("magma_injection_park");
+        optgroup->append_single_option_line("magma_iron_tube_ends");
+        optgroup->append_single_option_line("magma_injection_filament");
+
         optgroup = page->new_optgroup(L("Advanced"), L"param_advanced");
         optgroup->append_single_option_line("align_infill_direction_to_model", "strength_settings_advanced#align-infill-direction-to-model");
         optgroup->append_single_option_line("extra_solid_infills", "strength_settings_infill#extra-solid-infill");
@@ -2530,6 +2560,12 @@ void TabPrint::build()
         optgroup->append_single_option_line("max_volumetric_extrusion_rate_slope", "speed_settings_advanced");
         optgroup->append_single_option_line("max_volumetric_extrusion_rate_slope_segment_length", "speed_settings_advanced");
         optgroup->append_single_option_line("extrusion_rate_smoothing_external_perimeter_only", "speed_settings_advanced");
+
+        optgroup = page->new_optgroup(L("Dual infill zone speed"), L"param_dual_infill", 15);
+        optgroup->append_single_option_line("dual_infill_outer_speed");
+        optgroup->append_single_option_line("dual_infill_shell_speed");
+        optgroup->append_single_option_line("dual_infill_floor_speed");
+        optgroup->append_single_option_line("dual_infill_ceiling_speed");
 
     page = add_options_page(L("Support"), "custom-gcode_support"); // ORCA: icon only visible on placeholders
         optgroup = page->new_optgroup(L("Support"), L"param_support");

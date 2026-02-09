@@ -18,6 +18,8 @@
 #include "FillTpmsD.hpp"
 #include "FillTpmsFK.hpp"
 #include "FillConcentric.hpp"
+#include "FillMagma.hpp"
+#include "../Magma/MagmaTubeMap.hpp"
 #include "libslic3r.h"
 
 namespace Slic3r {
@@ -859,7 +861,19 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
                     params.symmetric_infill_y_axis = region_config.symmetric_infill_y_axis;
                 }
 
-                if (surface.is_solid()) {
+                // Dual infill zone pattern handling - must come before is_solid() check
+                // Outer zone uses configured pattern (sparse during print, solid after injection)
+                // Zone floor/ceiling use solid infill (they're the shell layers)
+                // Inner zone uses user's sparse infill pattern (already set as default above)
+                if (surface.is_zone_outer()) {
+                    // Use Magma Triangle pattern for outer zone (always)
+                    params.pattern = ipMagmaTriangle;
+                    // Keep sparse density - pattern is sparse until post-print injection
+                } else if (surface.is_zone_boundary()) {
+                    // Zone floor/ceiling are solid shell surfaces
+                    params.pattern = region_config.internal_solid_infill_pattern.value;
+                    params.density = 100.f;
+                } else if (surface.is_solid()) {
                     if (surface.is_external() && !is_bridge) {
                         if (surface.is_top()) {
                             params.pattern = region_config.top_surface_pattern.value;
@@ -887,6 +901,12 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
                         params.extrusion_role = erInternalBridgeInfill;
                     else
                         params.extrusion_role = erBridgeInfill;
+                } else if (surface.is_zone_outer()) {
+                    params.extrusion_role = erZoneOuterInfill;
+                } else if (surface.is_zone_ceiling()) {
+                    params.extrusion_role = erZoneCeiling;
+                } else if (surface.is_zone_floor()) {
+                    params.extrusion_role = erZoneFloor;
                 } else if (surface.is_solid()) {
                     if (surface.is_top()) {
                         params.extrusion_role = erTopSolidInfill;
@@ -930,6 +950,17 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
                         params.top_surface_speed = region_config.top_surface_speed;
                     } else if (params.extrusion_role == erSolidInfill)
                         params.solid_infill_speed = region_config.internal_solid_infill_speed;
+                    else if (params.extrusion_role == erBottomSurface)
+                        params.solid_infill_speed = region_config.internal_solid_infill_speed;
+                    else if (params.extrusion_role == erZoneOuterInfill)
+                        // Outer zone infill (U-tubes) uses sparse infill speed
+                        params.sparse_infill_speed = region_config.sparse_infill_speed;
+                    else if (params.extrusion_role == erZoneFloor)
+                        // Zone floor uses internal solid infill speed
+                        params.solid_infill_speed = region_config.internal_solid_infill_speed;
+                    else if (params.extrusion_role == erZoneCeiling)
+                        // Zone ceiling uses top surface speed (may need bridging)
+                        params.top_surface_speed = region_config.top_surface_speed;
                 }
 				// Calculate flow spacing for infill pattern generation.
 		        if (surface.is_solid() || is_bridge) {
@@ -1171,7 +1202,9 @@ void export_group_fills_to_svg(const char *path, const std::vector<SurfaceFill> 
 #endif
 
 // friend to Layer
-void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive::Octree* support_fill_octree, FillLightning::Generator* lightning_generator)
+void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive::Octree* support_fill_octree,
+                       FillLightning::Generator* lightning_generator,
+                       const magma::MagmaTubeMap* tube_map)
 {
 	for (LayerRegion *layerm : m_regions)
 		layerm->fills.clear();
@@ -1213,8 +1246,13 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
             assert(fill_concentric != nullptr);
             fill_concentric->print_config = &this->object()->print()->config();
             fill_concentric->print_object_config = &this->object()->config();
-        } else if (surface_fill.params.pattern == ipLightning)
+        } else if (surface_fill.params.pattern == ipLightning) {
             dynamic_cast<FillLightning::Filler*>(f.get())->generator = lightning_generator;
+        } else if (surface_fill.params.pattern == ipMagmaTriangle) {
+            auto* fill_magma = dynamic_cast<FillMagmaTriangle*>(f.get());
+            if (fill_magma)
+                fill_magma->tube_map = tube_map;
+        }
         // calculate flow spacing for infill pattern generation
         bool using_internal_flow = ! surface_fill.surface.is_solid() && ! surface_fill.params.bridge;
         double link_max_length = 0.;

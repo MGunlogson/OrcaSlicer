@@ -221,9 +221,13 @@ static t_config_enum_values s_keys_map_InfillPattern {
     { "concentric", ipConcentric },
     { "hilbertcurve", ipHilbertCurve },
     { "archimedeanchords", ipArchimedeanChords },
-    { "octagramspiral", ipOctagramSpiral }
+    { "octagramspiral", ipOctagramSpiral },
+    // Magma infill pattern for vertical reinforcement
+    { "magmatriangle", ipMagmaTriangle }
 };
 CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(InfillPattern)
+
+// MagmaPattern enum removed - dual_infill_outer_pattern uses InfillPattern directly
 
 static t_config_enum_values s_keys_map_IroningType {
     { "no ironing",     int(IroningType::NoIroning) },
@@ -2785,6 +2789,8 @@ void PrintConfigDef::init_fff_params()
     def->enum_values.push_back("hilbertcurve");
     def->enum_values.push_back("archimedeanchords");
     def->enum_values.push_back("octagramspiral");
+    // Magma infill pattern
+    def->enum_values.push_back("magmatriangle");
     def->enum_labels.push_back(L("Rectilinear"));
     def->enum_labels.push_back(L("Aligned Rectilinear"));
     def->enum_labels.push_back(L("Zig Zag"));
@@ -2811,6 +2817,8 @@ void PrintConfigDef::init_fff_params()
     def->enum_labels.push_back(L("Hilbert Curve"));
     def->enum_labels.push_back(L("Archimedean Chords"));
     def->enum_labels.push_back(L("Octagram Spiral"));
+    // Magma infill pattern
+    def->enum_labels.push_back(L("Magma Triangle"));
     def->set_default_value(new ConfigOptionEnum<InfillPattern>(ipCrossHatch));
 
     def           = this->add("lateral_lattice_angle_1", coFloat);
@@ -5082,6 +5090,304 @@ void PrintConfigDef::init_fff_params()
     def->tooltip = L("Use scarf joint for inner walls as well.");
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionBool(false));
+
+    // Dual infill zones configuration (inner/outer zones with shell boundary)
+    // Outer zone always uses Magma Triangle infill at 100% density
+    def = this->add("dual_infill_enabled", coBool);
+    def->label = L("Enable dual infill zones");
+    def->category = L("Strength");
+    def->tooltip = L("Split infill into inner and outer zones. The outer zone uses Magma Triangle infill "
+                     "for injection reinforcement, while the inner zone uses the sparse infill pattern "
+                     "configured above. Use lightweight inner infill (Support Cubic, Lightning) to save "
+                     "weight while maintaining perimeter strength through injection channels.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
+    // magma_pattern removed - outer zone always uses ipMagmaTriangle
+
+    def = this->add("dual_infill_outer_width", coFloat);
+    def->label = L("Outer zone width");
+    def->category = L("Strength");
+    def->tooltip = L("Width of the outer infill zone (Magma Triangle) in mm. Larger values create a thicker "
+                     "reinforced region around the perimeter.");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->max = 50;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(5.0));
+
+    def = this->add("dual_infill_shell_walls", coInt);
+    def->label = L("Shell wall count");
+    def->category = L("Strength");
+    def->tooltip = L("Number of walls in the boundary shell between inner and outer infill zones.");
+    def->min = 1;
+    def->max = 10;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionInt(1));
+
+    def = this->add("dual_infill_shell_width", coFloatOrPercent);
+    def->label = L("Shell line width");
+    def->category = L("Strength");
+    def->tooltip = L("Line width for the boundary shell walls. Use 0 or percentage for automatic calculation.");
+    def->sidetext = L("mm or %");
+    def->ratio_over = "nozzle_diameter";
+    def->min = 0;
+    def->max = 2;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloatOrPercent(0, false));
+
+    def = this->add("dual_infill_min_inner_width", coFloat);
+    def->label = L("Minimum inner zone width");
+    def->category = L("Strength");
+    def->tooltip = L("Minimum width for the inner infill zone. Areas smaller than this will be filled entirely "
+                     "with Magma Triangle infill.");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->max = 50;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(10.0));
+
+    def = this->add("dual_infill_solid_layers", coInt);
+    def->label = L("Solid transition layers");
+    def->category = L("Strength");
+    def->tooltip = L("Number of solid layers at the top and bottom of the boundary shell for proper sealing.");
+    def->sidetext = L("layers");
+    def->min = 1;
+    def->max = 10;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionInt(1));
+
+    def = this->add("dual_infill_solid_thickness", coFloat);
+    def->label = L("Solid transition thickness");
+    def->category = L("Strength");
+    def->tooltip = L("Minimum thickness of solid infill at zone floor and ceiling transitions. "
+                     "Floor/ceiling detection uses both layer count AND thickness - whichever requires "
+                     "more layers wins. Set to 0 to use only layer count.");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->max = 10;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0));
+
+    def = this->add("dual_infill_outer_speed", coFloat);
+    def->label = L("Outer zone speed");
+    def->category = L("Speed");
+    def->tooltip = L("Speed for outer zone infill (Magma Triangle channels). "
+                     "Set to 0 to use sparse infill speed.");
+    def->sidetext = L("mm/s");
+    def->min = 0;
+    def->max = 1000;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0));
+
+    def = this->add("dual_infill_shell_speed", coFloat);
+    def->label = L("Shell speed");
+    def->category = L("Speed");
+    def->tooltip = L("Speed for boundary shell perimeter walls. "
+                     "Set to 0 to use inner wall speed.");
+    def->sidetext = L("mm/s");
+    def->min = 0;
+    def->max = 1000;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0));
+
+    def = this->add("dual_infill_floor_speed", coFloat);
+    def->label = L("Zone floor speed");
+    def->category = L("Speed");
+    def->tooltip = L("Speed for zone floor surfaces (bottom of boundary shell). "
+                     "Set to 0 to use internal solid infill speed.");
+    def->sidetext = L("mm/s");
+    def->min = 0;
+    def->max = 1000;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0));
+
+    def = this->add("dual_infill_ceiling_speed", coFloat);
+    def->label = L("Zone ceiling speed");
+    def->category = L("Speed");
+    def->tooltip = L("Speed for zone ceiling surfaces (top of boundary shell). "
+                     "Set to 0 to use top surface speed.");
+    def->sidetext = L("mm/s");
+    def->min = 0;
+    def->max = 1000;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0));
+
+    def = this->add("magma_interior_width", coFloat);
+    def->label = L("Injection tube width");
+    def->category = L("Strength");
+    def->tooltip = L("Size of the cell hole (injection channel). Set to 0 for auto-calculation "
+                     "(nozzle diameter + 0.2mm, recommended). Larger values create wider channels "
+                     "but reduce infill density.");
+    def->sidetext = L("mm");
+    def->min = 0;  // 0 = auto
+    def->max = 5.0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0));  // 0 = auto
+
+    def = this->add("magma_window_height", coInt);
+    def->label = L("Window height");
+    def->category = L("Strength");
+    def->tooltip = L("Height of window gaps in layers. 0 = auto-calculate from tube geometry "
+                     "(recommended). Auto-calculation ensures window cross-sectional area "
+                     "approximately matches tube interior for optimal injection flow, plus "
+                     "one layer safety margin.");
+    def->sidetext = L("layers");
+    def->min = 0;  // 0 = auto
+    def->max = 20;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionInt(0));  // 0 = auto
+
+    def = this->add("magma_tube_height_layers", coInt);
+    def->label = L("Tube height");
+    def->category = L("Strength");
+    def->tooltip = L("Height of U-tube segments in layers. 0 = auto-calculate from window height "
+                     "(recommended). Auto uses window_height * 2 + 2 layers, ensuring enough solid "
+                     "wall above and below each window. Longer tubes provide stronger Z-axis "
+                     "interlocking but risk cooling during injection.");
+    def->sidetext = L("layers");
+    def->min = 0;  // 0 = auto
+    def->max = 200;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionInt(0));  // 0 = auto
+
+    def = this->add("magma_tube_height", coFloat);
+    def->label = L("Tube height");
+    def->category = L("Strength");
+    def->tooltip = L("Minimum height of U-tube segments in mm. 0 = use layer count only. "
+                     "When both layer count and mm are specified, whichever requires more "
+                     "layers wins.");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->max = 100;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0));
+
+    def = this->add("magma_stagger_levels", coInt);
+    def->label = L("Stagger levels");
+    def->category = L("Strength");
+    def->tooltip = L("Number of Z-offset groups for window staggering. Windows in different stagger "
+                     "groups open at different layers, preventing horizontal weak planes. "
+                     "3 is optimal for the triangular lattice — it guarantees all neighboring cells "
+                     "have different stagger levels (perfect 3-coloring). Higher values reduce the "
+                     "number of simultaneous windows globally but don't improve local interlock. "
+                     "Automatically limited to tube_height / window_height to prevent overlap.");
+    def->sidetext = L("levels");
+    def->min = 1;
+    def->max = 10;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionInt(3));
+
+    def = this->add("magma_fill_depth_factor", coFloat);
+    def->label = L("Fill depth factor");
+    def->category = L("Strength");
+    def->tooltip = L("Empirical scaling factor for auto-calculated maximum tube depth. "
+                     "The auto calculation models both pressure drop through the narrow "
+                     "tube channels and thermal freezing of the injected plastic. "
+                     "Higher values allow taller tubes. "
+                     "Calibrate by test printing — especially when using higher injection "
+                     "temperatures, which reduce viscosity and allow deeper fills. "
+                     "If tubes are underfilled, increase. If plastic doesn't reach "
+                     "tube bottom, decrease.");
+    def->min = 0.5;
+    def->max = 20.0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(3.0));
+
+    def = this->add("magma_tube_fill_factor", coFloat);
+    def->label = L("Tube fill factor");
+    def->category = L("Strength");
+    def->tooltip = L("Flow ratio for injection fill. 1.0 uses calculated tube volume. "
+                     "Increase if tubes are underfilled, decrease if overfilled. "
+                     "Similar to flow ratio settings for extrusion.");
+    def->min = 0.5;
+    def->max = 2.0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(1.0));
+
+    def = this->add("magma_spiral_interlock", coBool);
+    def->label = L("Spiral interlock");
+    def->category = L("Strength");
+    def->tooltip = L("Shift the Magma Triangle pattern each layer so tubes follow helical paths. "
+                     "Adds some pullout resistance beyond what tube wall roughness already provides, "
+                     "but increases injection flow resistance, uses more horizontal space per tube "
+                     "(harder to fit in thin sections), and reduces vertical reinforcement effectiveness. "
+                     "Only worth enabling for parts with specific shear/lateral load requirements.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("magma_injection_temp", coInt);
+    def->label = L("Injection temperature");
+    def->category = L("Strength");
+    def->tooltip = L("Temperature for Magma injection. Set higher than print temp to improve flow "
+                     "into tubes. 0 = use current print temperature (no change). "
+                     "Clamped to nozzle max temperature if set.");
+    def->min = 0;
+    def->max = 500;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionInt(0));
+
+    def = this->add("magma_injection_speed", coFloat);
+    def->label = L("Injection speed");
+    def->category = L("Strength");
+    def->tooltip = L("Volumetric flow rate for stationary injection into tubes (mm\u00b3/s). "
+                     "This controls both the G-code feedrate and the auto-calculated max "
+                     "tube depth — slower injection means more cooling time, so tubes must "
+                     "be shorter. 0 = auto-calculate from extruder pressure model. "
+                     "Note: actual speed is limited by your hotend's melt capacity "
+                     "(filament max volumetric speed). If injection seems to skip or "
+                     "click, reduce this value.");
+    def->sidetext = L("mm\u00b3/s");
+    def->min = 0;
+    def->max = 50;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0));
+
+    def = this->add("magma_iron_tube_ends", coBool);
+    def->label = L("Iron tube ends");
+    def->category = L("Strength");
+    def->tooltip = L("Iron over tube injection points after filling. Smooths the top surface and "
+                     "helps seal the tube opening. Uses your configured ironing speed and flow settings.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("magma_injection_park", coBool);
+    def->label = L("Park during temp change");
+    def->category = L("Strength");
+    def->tooltip = L("Move nozzle away from print during injection temperature changes. "
+                     "Reduces ooze on printed surfaces but increases travel time.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(true));
+
+    def = this->add("magma_injection_dwell", coInt);
+    def->label = L("Injection dwell time");
+    def->category = L("Strength");
+    def->tooltip = L("Pause after each tube injection for air displacement. 0 = no pause.");
+    def->sidetext = L("ms");
+    def->min = 0;
+    def->max = 10000;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionInt(0));
+
+    def = this->add("magma_injection_z_slam", coBool);
+    def->label = L("Injection Z-slam seal");
+    def->category = L("Strength");
+    def->tooltip = L("Lower the nozzle 0.1mm into the print surface during injection "
+                     "to seal against the hole and reduce leakage. The nozzle stays "
+                     "pressed down during extrusion and dwell, then returns to normal height.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(true));
+
+    def = this->add("magma_injection_filament", coInt);
+    def->gui_type = ConfigOptionDef::GUIType::i_enum_open;
+    def->label = L("Injection filament");
+    def->category = L("Extruders");
+    def->tooltip = L("Filament to use for Magma tube injection. Use a different filament "
+                     "for injection when you want the reinforcement material to differ from "
+                     "the print material. 0 = use the current printing filament.");
+    def->min = 0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionInt(0));
 
     def = this->add("role_based_wipe_speed", coBool);
     def->label = L("Role base wipe speed");
@@ -7784,8 +8090,7 @@ DynamicPrintConfig* DynamicPrintConfig::new_from_defaults_keys(const std::vector
 
 double min_object_distance(const ConfigBase &cfg)
 {
-    const ConfigOptionEnum<PrinterTechnology> *opt_printer_technology = cfg.option<ConfigOptionEnum<PrinterTechnology>>("printer_technology");
-    auto printer_technology = opt_printer_technology ? opt_printer_technology->value : ptUnknown;
+    auto printer_technology = cfg.opt_enum_or<PrinterTechnology>("printer_technology", ptUnknown);
 
     double ret = 0.;
 

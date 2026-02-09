@@ -493,6 +493,12 @@ std::vector<unsigned int> Print::support_material_extruders() const
                 extruders.emplace_back((i >= num_extruders) ? 0 : i);
             }
         }
+
+        // Magma injection filament
+        if (object->config().magma_injection_filament.value > 0) {
+            unsigned int i = (unsigned int)object->config().magma_injection_filament.value - 1;
+            extruders.emplace_back((i >= num_extruders) ? 0 : i);
+        }
     }
 
     if (support_uses_current_extruder)
@@ -1108,6 +1114,12 @@ StringObjectException Print::check_multi_filament_valid(const Print& print)
                 if (print_object->config().support_interface_filament >= 1 && (unsigned int)print_object->config().support_interface_filament < num_extruders + 1)
                     obj_used_extruder_ids.insert((unsigned int) print_object->config().support_interface_filament - 1);
             }
+            // Magma injection filament
+            {
+                auto num_ext = (unsigned int)print_config.filament_diameter.size();
+                if (print_object->config().magma_injection_filament.value >= 1 && (unsigned int)print_object->config().magma_injection_filament.value < num_ext + 1)
+                    obj_used_extruder_ids.insert((unsigned int) print_object->config().magma_injection_filament.value - 1);
+            }
             std::vector<std::string> filament_types;
             filament_types.reserve(obj_used_extruder_ids.size());
             for (const auto &extruder_idx : obj_used_extruder_ids) filament_types.push_back(print_config.filament_type.get_at(extruder_idx));
@@ -1247,6 +1259,14 @@ StringObjectException Print::validate(StringObjectException *warning, Polygons* 
                 return !Layer::is_perimeter_compatible(ra, rb);
             })) {
                 return {L("The spiral vase mode does not work when an object contains more than one materials."), nullptr, "spiral_mode"};
+            }
+        }
+        // Magma infill is incompatible with spiral vase (multi-cell grid vs single-wall spiral)
+        for (const auto& region : all_regions) {
+            if (region.get().config().sparse_infill_pattern.value == ipMagmaTriangle ||
+                region.get().config().dual_infill_enabled.value) {
+                return {L("Spiral vase mode is not compatible with Magma infill."),
+                        nullptr, "spiral_mode"};
             }
         }
     }

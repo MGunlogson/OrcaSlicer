@@ -1,0 +1,44 @@
+#ifndef slic3r_MagmaInjection_hpp_
+#define slic3r_MagmaInjection_hpp_
+
+#include "../Point.hpp"
+
+#include <string>
+#include <vector>
+
+namespace Slic3r {
+
+class GCode;
+class Print;
+
+namespace magma {
+
+class MagmaTubeMap;
+
+struct InjectionPoint {
+    Vec2d  position;      // XY center of injection cell (mm, unscaled)
+    double volume_mm3;    // volume to inject (after fill_factor)
+    int    pair_index;    // index into tube map pairs
+    int    start_layer;   // pair_start_layer (for computing z_bot)
+    int    window_center_layer;  // center layer of window gap (for visualization)
+};
+
+// Collect injection points for tubes whose cap layer == layer_id.
+std::vector<InjectionPoint> collect_injection_points(
+    const MagmaTubeMap& tube_map,
+    int layer_id);
+
+// Generate injection G-code for this layer.
+// Returns empty string if no injection points exist.
+// actual_layer_height: this layer's height (for flow calculations with adaptive layers).
+std::string generate_injection_gcode(
+    GCode& gcodegen,
+    const MagmaTubeMap& tube_map,
+    const std::vector<InjectionPoint>& points,
+    double layer_z,
+    double actual_layer_height);
+
+} // namespace magma
+} // namespace Slic3r
+
+#endif // slic3r_MagmaInjection_hpp_
