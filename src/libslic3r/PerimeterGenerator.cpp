@@ -2312,15 +2312,29 @@ void PerimeterGenerator::process_arachne()
                 // - Outer zone (between model perimeter and shell outer edge) for U-tube infill
                 // - Yolk (inside shell walls) for sparse infill
                 //
-                // We use inner_shell_boundary (same as zone_boundary clipped to infill_contour)
-                // to match what floor/ceiling detection uses. This ensures boundaries are consistent:
-                // - Outer zone extends TO inner_shell_boundary (shell outer edge)
-                // - Yolk is FROM getInnerContour() (shell inner edge)
-                // - Floor/ceiling detection uses zone_boundary which matches inner_shell_boundary
-                // NOTE: No ApplySafetyOffset here - it would expand outer_zone into zone_boundary,
+                // Shell perimeters are inscribed inside zone_boundary (outer edge AT boundary,
+                // walls extend inward). We account for shell width when computing fill surfaces,
+                // mirroring how model perimeters handle infill contours:
+                //
+                // 1. Grow zone_boundary outward by shell_line_width/2 to create clearance
+                //    from the shell outer wall (same as model infill being inside perimeters)
+                // 2. Apply infill_wall_overlap to expand fill back toward shell for adhesion
+                //    (same as regular infill_wall_overlap with model perimeters)
+                //
+                // NOTE: No ApplySafetyOffset — it would expand outer_zone into zone_boundary,
                 // causing floor/ceiling (detected inside zone_boundary) to appear in outer_zone.
-                ExPolygons outer_zone = diff_ex(infill_contour, inner_shell_boundary);
-                ExPolygons yolk = union_ex(innerShellPaths.getInnerContour());
+                coord_t zone_infill_overlap = coord_t(scale_(
+                    this->config->infill_wall_overlap.get_abs_value(
+                        unscale<double>(shell_line_width))));
+                coord_t shell_clearance = shell_line_width / 2 - zone_infill_overlap;
+                // Clamp: don't let overlap exceed clearance (would push fill past boundary)
+                if (shell_clearance < 0)
+                    shell_clearance = 0;
+
+                ExPolygons outer_zone_boundary = offset_ex(inner_shell_boundary, shell_clearance);
+                ExPolygons outer_zone = diff_ex(infill_contour, outer_zone_boundary);
+                ExPolygons yolk = offset_ex(
+                    union_ex(innerShellPaths.getInnerContour()), zone_infill_overlap);
 
                 // Zone: Store inner zone for floor/ceiling clipping in slices_to_fill_surfaces_clipped()
                 // This ensures floor/ceiling surfaces stay within the zone shell boundary

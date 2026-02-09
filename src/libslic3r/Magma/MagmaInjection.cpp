@@ -7,6 +7,8 @@
 #include "../Print.hpp"
 #include "../ShortestPath.hpp"
 
+#include <igl/ramer_douglas_peucker.h>
+
 #include <algorithm>
 #include <cmath>
 #include <sstream>
@@ -121,9 +123,25 @@ static std::vector<Vec3d> build_tube_viz_waypoints(
         full_path.push_back({c.x(), c.y(), z});
     }
 
-    // Return full-resolution path (one point per layer per phase).
-    // With ~12-120 points per tube and ~1500 tubes, total vertex count
-    // is manageable (~20-40K) and the layer-by-layer spiral renders smoothly.
+    // Simplify with 3D Ramer-Douglas-Peucker.
+    // When spirals are off, each phase is a straight line so RDP reduces
+    // ~20-120 points down to ~5 (top_A, bot_A, window_B, bot_B, top_B).
+    // When spirals are on, RDP keeps points where the helix bends noticeably.
+    if (full_path.size() > 2) {
+        Eigen::MatrixXd P(full_path.size(), 3);
+        for (size_t i = 0; i < full_path.size(); ++i)
+            P.row(i) = full_path[i].transpose();
+
+        Eigen::MatrixXd S;
+        Eigen::VectorXi J;
+        igl::ramer_douglas_peucker(P, double(iw) * 0.1, S, J);
+
+        std::vector<Vec3d> simplified;
+        simplified.reserve(S.rows());
+        for (int i = 0; i < S.rows(); ++i)
+            simplified.push_back(S.row(i).transpose());
+        return simplified;
+    }
     return full_path;
 }
 
@@ -279,24 +297,42 @@ std::string generate_injection_gcode(
                 display_dim);
         gcode += buf;
 
-        // Emit tube visualization metadata for GCodeProcessor
-        {
-            const auto& pair = tube_map.u_tube_pairs()[pt.pair_index];
-            auto waypoints = build_tube_viz_waypoints(
-                tube_map, pair, layer_z, pt.window_center_layer,
-                first_layer_height, lh);
-            if (!waypoints.empty())
-                gcode += format_tube_viz_comment(waypoints, tube_map.interior_width());
-        }
+        // Build tube visualization waypoints (simplified with 3D RDP)
+        const auto& pair = tube_map.u_tube_pairs()[pt.pair_index];
+        auto waypoints = build_tube_viz_waypoints(
+            tube_map, pair, layer_z, pt.window_center_layer,
+            first_layer_height, lh);
 
-        // Stationary extrude (E-only, no XY movement)
+        // Emit tube visualization metadata for GCodeProcessor
+        if (!waypoints.empty())
+            gcode += format_tube_viz_comment(waypoints, tube_map.interior_width());
+
+        // Split injection into per-segment G1 E commands so the preview
+        // slider shows progressive tube filling.  Each G1 gets its own
+        // G-code line number, giving it a separate slider position.
         double filament_length = volume / filament_area;
         gcode += gcodegen.writer().set_speed(feedrate_mmmin);
+        Vec2d xy(gcodegen.writer().get_position().x(),
+                 gcodegen.writer().get_position().y());
 
-        Vec3d cur_pos = gcodegen.writer().get_position();
-        sprintf(buf, "Magma injection %.2f mm3", volume);
-        gcode += gcodegen.writer().extrude_to_xy(
-            Vec2d(cur_pos.x(), cur_pos.y()), filament_length, std::string(buf));
+        if (waypoints.size() >= 2) {
+            double total_path_len = 0;
+            for (size_t i = 1; i < waypoints.size(); ++i)
+                total_path_len += (waypoints[i] - waypoints[i - 1]).norm();
+
+            for (size_t i = 1; i < waypoints.size(); ++i) {
+                double seg_len = (waypoints[i] - waypoints[i - 1]).norm();
+                double seg_e = (total_path_len > 0)
+                    ? filament_length * (seg_len / total_path_len)
+                    : filament_length / double(waypoints.size() - 1);
+                gcode += gcodegen.writer().extrude_to_xy(
+                    xy, seg_e, "injection segment");
+            }
+        } else {
+            sprintf(buf, "Magma injection %.2f mm3", volume);
+            gcode += gcodegen.writer().extrude_to_xy(
+                xy, filament_length, std::string(buf));
+        }
 
         // Dwell for air displacement
         if (dwell_ms > 0) {

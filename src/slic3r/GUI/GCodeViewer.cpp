@@ -1384,7 +1384,26 @@ void GCodeViewer::render(int canvas_width, int canvas_height, int right_margin)
     auto endpoints = m_viewer.get_view_full_range();
     m_sequential_view.m_show_marker = m_sequential_view.m_show_marker || (current.back() != endpoints.back() && !m_no_render_path);
     const libvgcode::PathVertex& curr_vertex = m_viewer.get_current_vertex();
-    m_sequential_view.marker.set_world_position(libvgcode::convert(curr_vertex.position));
+    // For Magma injection tube visualization, the synthetic vertices trace
+    // the tube path below the surface, but the nozzle stays at the injection
+    // point.  Walk backward past Extrude+MagmaInjection vertices to find the
+    // Travel/Unretract at the real nozzle position.  Only Extrude type is
+    // checked so we stop at the inter-injection Travel (which also carries
+    // the MagmaInjection role, as is normal for travels between extrusions).
+    if (curr_vertex.role == libvgcode::EGCodeExtrusionRole::MagmaInjection &&
+        curr_vertex.type == libvgcode::EMoveType::Extrude) {
+        size_t id = m_viewer.get_current_vertex_id();
+        while (id > 0) {
+            const auto& v = m_viewer.get_vertex_at(id);
+            if (v.role != libvgcode::EGCodeExtrusionRole::MagmaInjection ||
+                v.type != libvgcode::EMoveType::Extrude)
+                break;
+            --id;
+        }
+        m_sequential_view.marker.set_world_position(libvgcode::convert(m_viewer.get_vertex_at(id).position));
+    } else {
+        m_sequential_view.marker.set_world_position(libvgcode::convert(curr_vertex.position));
+    }
     m_sequential_view.marker.set_z_offset(m_z_offset + 0.5f);
     // BBS fixed buttom margin. m_moves_slider.pos_y
     m_sequential_view.render(!m_no_render_path, legend_height, &m_viewer, m_viewer.get_current_vertex().gcode_id, canvas_width, canvas_height - bottom_margin * m_scale, right_margin * m_scale, m_viewer.get_view_type());

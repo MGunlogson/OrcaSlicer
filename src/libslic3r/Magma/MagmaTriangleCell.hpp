@@ -79,12 +79,12 @@ struct TriangleCell {
     bool is_down() const { return (a + b + c) == 1; }
 
     // Get stagger level for window timing (0 to num_levels-1)
+    // Uses (a - b) which gives a perfect 3-coloring of the triangular lattice:
+    // every cell's neighbors are guaranteed to have different stagger levels.
+    // Works well for any num_levels >= 3; optimal at 3 (chromatic number of
+    // the triangular lattice).
     int stagger_level(int num_levels) const {
-        // Use all coordinates for better distribution
-        int sum = a + b + c;
-        // For up triangles sum=2, for down sum=1
-        // Use a+b to differentiate within each type
-        return ((a + b) % num_levels + num_levels) % num_levels;
+        return ((a - b) % num_levels + num_levels) % num_levels;
     }
 
     // Get the paired cell for U-tube formation

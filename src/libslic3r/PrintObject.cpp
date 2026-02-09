@@ -1612,52 +1612,47 @@ void PrintObject::detect_surfaces_type()
                         resolve_surface_overlap(top, bottom, small_crack_threshold, lower_layer != nullptr, stTop);
                     }
 
-                    // zone floor/ceiling detection - uses same diff pattern as top/bottom.
+                    // zone floor/ceiling detection - mirrors stTop/stBottom pattern.
                     // Floor = yolk exposed from below (bottom of shell cavity)
-                    // Ceiling = yolk exposed from above (top of shell cavity)
+                    // Ceiling = zone exposed from above (top of shell cavity)
                     //
-                    // Like regular top/bottom surfaces, we detect on full slices (layerm_slices_surfaces)
-                    // using zone_boundary. The surfaces later get clipped to fill_expolygons in
-                    // slices_to_fill_surfaces_clipped(), which naturally aligns them to the actual
-                    // infill area computed by PerimeterGenerator. No approximations needed.
+                    // Ceiling uses zone_boundary (full zone including shell perimeters),
+                    // mirroring how stTop uses the full layer slice (including perimeters).
+                    // This ensures the ceiling ring covers zone shell perimeters, so
+                    // propagation creates stInternalSolid below overhanging shell walls.
+                    // slices_to_fill_surfaces_clipped() clips fill version to inner_zone.
+                    //
+                    // Floor uses inner_zone (Arachne-computed yolk boundary). The wider
+                    // zone_boundary detection isn't needed for floor because the outer zone
+                    // below is already solid (stZoneOuter). Floor propagates UP into the
+                    // yolk like stBottom propagates UP into the model.
                     Surfaces zone_floor;
                     Surfaces zone_ceiling;
                     const PrintRegionConfig& region_config = layerm->region().config();
                     if (region_config.dual_infill_enabled && !layer->zone_boundary.empty()) {
-                        // Inner zone (yolk) = area inside zone_boundary
-                        // This is detected on full slices; clipping to infill area happens later
-                        ExPolygons current_inner = intersection_ex(layerm_slices_surfaces, layer->zone_boundary);
-
-                        // Get adjacent zones using same geometric approach
+                        // Floor: inner_zone (Arachne-aligned yolk) — outer zone already solid
+                        ExPolygons current_inner = layerm->inner_zone;
                         ExPolygons lower_inner;
-                        ExPolygons upper_inner;
-
-                        if (lower_layer && !lower_layer->zone_boundary.empty()) {
-                            // Lower layer has dual infill zone - compute its yolk
-                            ExPolygons lower_region_slices = interface_shells ?
-                                to_expolygons(lower_layer->m_regions[region_id]->slices.surfaces) :
-                                lower_layer->lslices;
-                            lower_inner = intersection_ex(lower_region_slices, lower_layer->zone_boundary);
+                        if (lower_layer) {
+                            lower_inner = lower_layer->m_regions[region_id]->inner_zone;
                         }
 
-                        if (upper_layer && !upper_layer->zone_boundary.empty()) {
-                            // Upper layer has dual infill zone - compute its yolk
-                            ExPolygons upper_region_slices = interface_shells ?
-                                to_expolygons(upper_layer->m_regions[region_id]->slices.surfaces) :
-                                upper_layer->lslices;
-                            upper_inner = intersection_ex(upper_region_slices, upper_layer->zone_boundary);
+                        // Ceiling: zone_boundary (wide, includes shell perimeters) for propagation
+                        ExPolygons current_zone = layer->zone_boundary;
+                        ExPolygons upper_zone;
+                        if (upper_layer) {
+                            upper_zone = upper_layer->zone_boundary;
                         }
 
-                        // Zone floor = inner zone exposed from below (bottom of shell cavity, where yolk first appears)
-                        // Floor is detected in the inner zone (yolk) to close off the bottom of the cavity.
+                        // Zone floor = yolk exposed from below (bottom of shell cavity)
                         if (!current_inner.empty()) {
                             ExPolygons floor_ex = compute_exposed_area(current_inner, lower_inner, offset);
                             surfaces_append(zone_floor, std::move(floor_ex), stZoneFloor);
                         }
 
-                        // Zone ceiling = inner zone exposed from above (top of shell cavity, where yolk ends)
-                        if (!current_inner.empty()) {
-                            ExPolygons ceiling_ex = compute_exposed_area(current_inner, upper_inner, offset);
+                        // Zone ceiling = zone exposed from above (top of shell cavity)
+                        if (!current_zone.empty()) {
+                            ExPolygons ceiling_ex = compute_exposed_area(current_zone, upper_zone, offset);
                             surfaces_append(zone_ceiling, std::move(ceiling_ex), stZoneCeiling);
                         }
 
@@ -2323,8 +2318,11 @@ void PrintObject::discover_vertical_shells()
 
                     // Trim the shells region by the internal & internal void surfaces.
                     // Zone: Include stZoneOuter so shells can expand into outer zone.
-                    // Users who want zone infill right after first layer can set top/bottom layers to 1.
-                    const Polygons polygonsInternal = to_polygons(layerm->fill_surfaces.filter_by_types({ stInternal, stInternalVoid, stInternalSolid, stZoneOuter }));
+                    // Zone: Include stZoneFloor/stZoneCeiling so propagation can convert them
+                    // to stInternalSolid. Unlike stTop/stBottom (which exist at the model edge),
+                    // floor/ceiling exist IN the yolk fill area. Without this, propagation can't
+                    // reach yolk areas that have floor/ceiling, leaving random patches.
+                    const Polygons polygonsInternal = to_polygons(layerm->fill_surfaces.filter_by_types({ stInternal, stInternalVoid, stInternalSolid, stZoneOuter, stZoneFloor, stZoneCeiling }));
                     shell = intersection(shell, polygonsInternal, ApplySafetyOffset::Yes);
                     polygons_append(shell, diff(polygonsInternal, holes));
                     if (shell.empty())
@@ -2410,6 +2408,10 @@ void PrintObject::discover_vertical_shells()
                     Slic3r::ExPolygons new_internal_void = diff_ex(layerm->fill_surfaces.filter_by_type(stInternalVoid), regularized_shell);
                     // Zone: Also trim the outer infill zone by the shell
                     Slic3r::ExPolygons new_zone_outer = diff_ex(layerm->fill_surfaces.filter_by_type(stZoneOuter), regularized_shell);
+                    // Zone: Trim floor/ceiling by the shell so propagated stInternalSolid
+                    // replaces them (floor/ceiling are in polygonsInternal, not keep_types)
+                    Slic3r::ExPolygons new_zone_floor = diff_ex(layerm->fill_surfaces.filter_by_type(stZoneFloor), regularized_shell);
+                    Slic3r::ExPolygons new_zone_ceiling = diff_ex(layerm->fill_surfaces.filter_by_type(stZoneCeiling), regularized_shell);
 
 #ifdef SLIC3R_DEBUG_SLICE_PROCESSING
                     {
@@ -2420,13 +2422,18 @@ void PrintObject::discover_vertical_shells()
 #endif /* SLIC3R_DEBUG_SLICE_PROCESSING */
 
                     // Assign resulting internal surfaces to layer.
-                    // Keep boundary types: stTop, stBottom, stBottomBridge, and zone boundaries
-                    layerm->fill_surfaces.keep_types({ stTop, stBottom, stBottomBridge, stZoneFloor, stZoneCeiling });
+                    // Keep boundary types: stTop, stBottom, stBottomBridge
+                    // Zone floor/ceiling are trimmed by the shell above (not in keep_types)
+                    // because they exist in the yolk fill area and must be convertible
+                    // to stInternalSolid by propagation.
+                    layerm->fill_surfaces.keep_types({ stTop, stBottom, stBottomBridge });
                     layerm->fill_surfaces.append(new_internal,       stInternal);
                     layerm->fill_surfaces.append(new_internal_void,  stInternalVoid);
                     layerm->fill_surfaces.append(new_internal_solid, stInternalSolid);
-                    // Zone: Re-add the trimmed outer infill zone
+                    // Zone: Re-add the trimmed surfaces
                     layerm->fill_surfaces.append(new_zone_outer,    stZoneOuter);
+                    layerm->fill_surfaces.append(new_zone_floor,    stZoneFloor);
+                    layerm->fill_surfaces.append(new_zone_ceiling,  stZoneCeiling);
                 } // for each layer
             });
         m_print->throw_if_canceled();
@@ -3959,11 +3966,6 @@ void PrintObject::discover_horizontal_shells()
                                 surface.surface_type == stZoneOuter ||
                                 surface.is_zone_boundary())
                                 polygons_append(internal, to_polygons(surface.expolygon));
-                        // Zone: Exclude yolk from shell propagation targets. The yolk is bounded
-                        // by zone shell walls (perimeters) and should be treated like the exterior
-                        // of the model - shell propagation stops at the shell wall boundary.
-                        if (!neighbor_layerm->inner_zone.empty())
-                            internal = diff(internal, to_polygons(neighbor_layerm->inner_zone));
                         new_internal_solid = intersection(solid, internal, ApplySafetyOffset::Yes);
                     }
                     if (new_internal_solid.empty()) {
@@ -4039,11 +4041,6 @@ void PrintObject::discover_horizontal_shells()
                                 // solid (filled with injected plastic) and doesn't need shell support.
                                 if (surface.is_internal() && !surface.is_bridge() && !surface.is_zone_outer())
                                     polygons_append(internal, to_polygons(surface.expolygon));
-                            // Zone: Exclude yolk from expansion targets. The yolk is bounded by
-                            // zone shell walls and should be treated like the exterior - expansion
-                            // cannot cross the shell wall boundary into the yolk.
-                            if (!neighbor_layerm->inner_zone.empty())
-                                internal = diff(internal, to_polygons(neighbor_layerm->inner_zone));
                             polygons_append(new_internal_solid,
                                 intersection(
                                     expand(too_narrow, +margin),

@@ -25,12 +25,13 @@ SpiralParams compute_spiral_params(float interior_width, float line_width, float
     constexpr float target_tube_overlap = 0.75f;
     const float max_disp_tube = (1.0f - target_tube_overlap) * interior_width;
 
-    // Constraint 3: Maximum helix angle for injection flow.
+    // Constraint 3: Maximum helix angle for injection flow and thin sections.
     // At low layer heights the per-layer geometric constraints allow the same
     // horizontal displacement as at thick layers, but over much less vertical
-    // distance, producing a steep helix that resists injection flow.  Cap so
-    // the helix angle never exceeds 45° (tan(45°) = 1.0).
-    constexpr float MAX_HELIX_TAN = 1.0f;   // tan(45°)
+    // distance, producing a steep helix that resists injection flow and takes
+    // more volumetric space (harder to fit tubes in thin sections).  Cap so
+    // the helix angle never exceeds ~27° (tan(27°) ≈ 0.5).
+    constexpr float MAX_HELIX_TAN = 0.5f;   // tan(~27°)
     const float max_disp_helix = MAX_HELIX_TAN * layer_height;
 
     // Use the most restrictive constraint

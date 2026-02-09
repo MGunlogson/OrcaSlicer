@@ -5114,7 +5114,7 @@ void PrintConfigDef::init_fff_params()
     def->min = 0;
     def->max = 50;
     def->mode = comAdvanced;
-    def->set_default_value(new ConfigOptionFloat(2.0));
+    def->set_default_value(new ConfigOptionFloat(5.0));
 
     def = this->add("dual_infill_shell_walls", coInt);
     def->label = L("Shell wall count");
@@ -5145,7 +5145,7 @@ void PrintConfigDef::init_fff_params()
     def->min = 0;
     def->max = 50;
     def->mode = comAdvanced;
-    def->set_default_value(new ConfigOptionFloat(5.0));
+    def->set_default_value(new ConfigOptionFloat(10.0));
 
     def = this->add("dual_infill_solid_layers", coInt);
     def->label = L("Solid transition layers");
@@ -5155,7 +5155,7 @@ void PrintConfigDef::init_fff_params()
     def->min = 1;
     def->max = 10;
     def->mode = comAdvanced;
-    def->set_default_value(new ConfigOptionInt(2));
+    def->set_default_value(new ConfigOptionInt(1));
 
     def = this->add("dual_infill_solid_thickness", coFloat);
     def->label = L("Solid transition thickness");
@@ -5167,7 +5167,7 @@ void PrintConfigDef::init_fff_params()
     def->min = 0;
     def->max = 10;
     def->mode = comAdvanced;
-    def->set_default_value(new ConfigOptionFloat(0.5));
+    def->set_default_value(new ConfigOptionFloat(0));
 
     def = this->add("dual_infill_outer_speed", coFloat);
     def->label = L("Outer zone speed");
@@ -5214,7 +5214,7 @@ void PrintConfigDef::init_fff_params()
     def->set_default_value(new ConfigOptionFloat(0));
 
     def = this->add("magma_interior_width", coFloat);
-    def->label = L("Interior width");
+    def->label = L("Injection tube width");
     def->category = L("Strength");
     def->tooltip = L("Size of the cell hole (injection channel). Set to 0 for auto-calculation "
                      "(nozzle diameter + 0.2mm, recommended). Larger values create wider channels "
@@ -5267,9 +5267,11 @@ void PrintConfigDef::init_fff_params()
     def->label = L("Stagger levels");
     def->category = L("Strength");
     def->tooltip = L("Number of Z-offset groups for window staggering. Windows in different stagger "
-                     "groups open at different layers, preventing horizontal weak planes. Higher values "
-                     "spread windows more evenly. Automatically limited to tube_height / window_height "
-                     "to ensure windows don't overlap. 3 is recommended for most prints.");
+                     "groups open at different layers, preventing horizontal weak planes. "
+                     "3 is optimal for the triangular lattice — it guarantees all neighboring cells "
+                     "have different stagger levels (perfect 3-coloring). Higher values reduce the "
+                     "number of simultaneous windows globally but don't improve local interlock. "
+                     "Automatically limited to tube_height / window_height to prevent overlap.");
     def->sidetext = L("levels");
     def->min = 1;
     def->max = 10;
@@ -5306,11 +5308,13 @@ void PrintConfigDef::init_fff_params()
     def = this->add("magma_spiral_interlock", coBool);
     def->label = L("Spiral interlock");
     def->category = L("Strength");
-    def->tooltip = L("Shift the Magma Triangle pattern in a circular motion each layer, creating "
-                     "interlocking helical tubes. When filled with injected plastic, adjacent tubes "
-                     "spiral around each other for stronger mechanical interlock.");
+    def->tooltip = L("Shift the Magma Triangle pattern each layer so tubes follow helical paths. "
+                     "Adds some pullout resistance beyond what tube wall roughness already provides, "
+                     "but increases injection flow resistance, uses more horizontal space per tube "
+                     "(harder to fit in thin sections), and reduces vertical reinforcement effectiveness. "
+                     "Only worth enabling for parts with specific shear/lateral load requirements.");
     def->mode = comAdvanced;
-    def->set_default_value(new ConfigOptionBool(true));
+    def->set_default_value(new ConfigOptionBool(false));
 
     def = this->add("magma_injection_temp", coInt);
     def->label = L("Injection temperature");

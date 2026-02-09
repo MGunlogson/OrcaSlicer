@@ -312,28 +312,25 @@ std::unique_ptr<MagmaTubeMap> MagmaTubeMap::build(
 void MagmaTubeMap::scan_layers(const std::vector<Layer*> &layers)
 {
     // Pre-compute ideal inset triangle area (scaled^2) for interior cells.
-    // Interior cells (center fully inside magma region) use this constant;
-    // only boundary cells need expensive polygon clipping.
     const double half_line_width = m_line_width * 0.5;
     const double side = triangle_side_length(m_cell_spacing);
-    const double ideal_area_mm2 = 0.433 * side * side;  // sqrt(3)/4 * side^2
     // Inset reduces effective side by ~line_width * 2/sqrt(3)
     const double inset_side = side - m_line_width * 2.0 * INV_SQRT3;
     const double inset_area_mm2 = (inset_side > 0) ? 0.433 * inset_side * inset_side : 0.0;
     const double inset_area_scaled2 = inset_area_mm2 * 1e12;  // (1e6)^2
 
-    const double min_area_mm2 = ideal_area_mm2 * 0.10;
-    const double min_area_scaled2 = min_area_mm2 * 1e12;
+    // Boundary cells require ≥50% of ideal tube area to be unobstructed.
+    // Below this, the tube cross-section is too constricted for plastic flow.
+    const double min_area_scaled2 = inset_area_scaled2 * 0.50;
 
-    // Inset distance for shrinking magma region to test "fully interior" cells.
-    // A cell center inside the shrunk region means ALL 3 corners are inside the original.
-    const coord_t interior_inset = scale_(m_cell_spacing * 0.6);  // conservative: > incircle radius
+    // Interior inset: if cell center is this far inside the magma region,
+    // the tube inscribed circle (diameter = interior_width) fits entirely.
+    // This is the tube-flow-relevant check, not the triangle-corner check.
+    const coord_t interior_inset = scale_(m_interior_width * 0.5);
 
-    // IMPORTANT: Use a FIXED reference lattice (no spiral offset) for cell identity.
-    // The spiral offset shifts the lattice origin per layer, which would produce
-    // different (a,b,c) coordinates for the same physical cell on each layer.
+    // FIXED reference lattice for cell IDENTITY (a,b,c coordinates).
     // Cell identity must be stable across layers for tube pairing to work.
-    // The spiral offset is only applied during infill rendering (FillMagma.cpp).
+    // Spiral offset is applied per-layer for POSITION checks below.
     TriangleLattice ref_lattice(m_cell_spacing, 0.0, 0.0);
 
     for (int i = 0; i < int(layers.size()); ++i) {
@@ -343,6 +340,12 @@ void MagmaTubeMap::scan_layers(const std::vector<Layer*> &layers)
         // FillMagma and GCode will query with (Layer::id() includes raft offset).
         const int layer_id = static_cast<int>(layer->id());
 
+        // Spiral-offset lattice for this layer's actual cell positions.
+        // Cell identity comes from ref_lattice, but position checks use the
+        // spiral-offset position (matching what FillMagma actually renders).
+        Vec2d spiral_off = compute_spiral_offset(m_spiral_params, layer_id);
+        TriangleLattice layer_lattice(m_cell_spacing, spiral_off.x(), spiral_off.y());
+
         // Collect surfaces where Magma infill will be generated
         ExPolygons magma_regions;
         for (const LayerRegion *layerm : layer->regions()) {
@@ -351,7 +354,6 @@ void MagmaTubeMap::scan_layers(const std::vector<Layer*> &layers)
                 if (surface.is_zone_outer()) {
                     magma_regions.push_back(surface.expolygon);
                 } else if (surface.surface_type == stInternal
-                           && !m_dual_infill_enabled
                            && region_config.sparse_infill_pattern.value == ipMagmaTriangle) {
                     magma_regions.push_back(surface.expolygon);
                 }
@@ -362,18 +364,22 @@ void MagmaTubeMap::scan_layers(const std::vector<Layer*> &layers)
         if (magma_regions.empty())
             continue;
 
-        // Shrink region once to identify fully-interior cells (no per-cell clipping needed)
+        // Shrink region to identify fully-interior cells: tube inscribed circle
+        // fits entirely within magma region → no per-cell clipping needed.
         ExPolygons interior_region = offset_ex(magma_regions, -interior_inset);
 
-        // Enumerate cells from fixed reference lattice covering zone bbox
+        // Enumerate cells from fixed reference lattice (stable identity)
         BoundingBox bbox = get_extents(magma_regions);
+        // Expand bbox slightly to account for spiral offset moving cells
+        bbox.offset(scale_(m_interior_width));
         std::vector<TriangleCell> cells = ref_lattice.enumerate_cells(bbox);
 
         for (const TriangleCell &cell : cells) {
-            Vec2d center_mm = ref_lattice.cell_center(cell);
+            // Use spiral-offset position for containment checks
+            Vec2d center_mm = layer_lattice.cell_center(cell);
             Point center_pt(scale_(center_mm.x()), scale_(center_mm.y()));
 
-            // Fast path: cell center inside shrunk region → fully interior
+            // Fast path: center inside tube-clearance inset → fully unobstructed
             bool is_interior = false;
             for (const ExPolygon &ep : interior_region) {
                 if (ep.contains(center_pt)) {
@@ -383,12 +389,11 @@ void MagmaTubeMap::scan_layers(const std::vector<Layer*> &layers)
             }
 
             if (is_interior) {
-                // Interior cell: use pre-computed ideal inset area
                 m_cells[cell].mark_present(layer_id, inset_area_scaled2);
                 continue;
             }
 
-            // Check if center is at least inside the original region
+            // Center must at least be inside the original region
             bool in_region = false;
             for (const ExPolygon &ep : magma_regions) {
                 if (ep.contains(center_pt)) {
@@ -398,10 +403,10 @@ void MagmaTubeMap::scan_layers(const std::vector<Layer*> &layers)
             }
 
             if (!in_region)
-                continue;  // Cell center outside magma region entirely
+                continue;
 
-            // Boundary cell: do the expensive clip to get actual area
-            std::array<Vec2d, 3> corners = ref_lattice.cell_corners(cell);
+            // Boundary cell: compute actual tube area at spiral-offset position
+            std::array<Vec2d, 3> corners = layer_lattice.cell_corners(cell);
             Polygon triangle;
             triangle.points.reserve(3);
             triangle.points.emplace_back(scale_(corners[0].x()), scale_(corners[0].y()));
@@ -537,20 +542,46 @@ void MagmaTubeMap::assign_default_tubes()
         if (!cell.is_up())
             continue;
 
-        TriangleCell partner = cell.get_paired_cell();  // a-axis down neighbor
+        // Try all 3 DN neighbors, pick the one with the longest total shared span.
+        // This fixes poor coverage at sloped boundaries where the a-axis partner
+        // only exists for a fraction of the cell's height but other neighbors
+        // have much better overlap.
+        auto neighbors = cell.neighbors();
+        TriangleCell best_partner;
+        int best_total_shared = 0;
+        const CellPresence *best_partner_presence = nullptr;
 
-        auto it = m_cells.find(partner);
-        if (it == m_cells.end())
+        for (const TriangleCell &neighbor : neighbors) {
+            auto nit = m_cells.find(neighbor);
+            if (nit == m_cells.end())
+                continue;
+
+            // Sum total shared layers across all contiguous spans
+            std::vector<SharedSpan> nspans = find_shared_spans(presence, nit->second);
+            int total = 0;
+            for (const SharedSpan &s : nspans)
+                total += s.end - s.start + 1;
+
+            if (total > best_total_shared) {
+                best_total_shared = total;
+                best_partner = neighbor;
+                best_partner_presence = &nit->second;
+            }
+        }
+
+        if (!best_partner_presence || best_total_shared < m_min_tube_height_layers)
             continue;
 
-        const CellPresence &partner_presence = it->second;
+        const CellPresence &partner_presence = *best_partner_presence;
+        TriangleCell partner = best_partner;
 
         // Phase offset: shifts tube boundaries so different cells have
         // tube tops/bottoms at different layers, avoiding weak planes.
+        // Computed from UP cell coordinates — doesn't depend on partner choice.
         int stagger = cell.stagger_level(stagger_levels);
         int phase_offset = stagger * (tube_h / stagger_levels);
 
-        // Find contiguous shared spans
+        // Find contiguous shared spans with the best partner
         std::vector<SharedSpan> spans = find_shared_spans(presence, partner_presence);
 
         for (const SharedSpan &span : spans) {
@@ -698,6 +729,8 @@ void MagmaTubeMap::assign_salvage_tubes()
     int skip_already_covered = 0;
     int skip_no_neighbors = 0;
     int skip_too_short = 0;
+    int fail_up = 0, fail_dn = 0;
+    int max_uncov_wasted = 0;  // largest uncovered span that failed
 
     for (const TriangleCell &cell : candidates) {
         const CellPresence &presence = m_cells.at(cell);
@@ -793,12 +826,16 @@ void MagmaTubeMap::assign_salvage_tubes()
             else
                 ++skip_too_short;
 
+            if (cell.is_up()) ++fail_up; else ++fail_dn;
+            max_uncov_wasted = std::max(max_uncov_wasted, uncovered_height);
+
         }
     }
 
-    BOOST_LOG_TRIVIAL(info) << "Magma salvage results: " << salvage_created << " pairs created, "
-        << skip_already_covered << " already covered, " << skip_no_neighbors << " no neighbors, "
-        << skip_too_short << " too short (min=" << m_min_tube_height_layers << "L)";
+    BOOST_LOG_TRIVIAL(info) << "[Magma] Salvage results: " << salvage_created << " created, "
+        << skip_already_covered << " covered, " << skip_no_neighbors << " no_nbrs, "
+        << skip_too_short << " too_short (min=" << m_min_tube_height_layers << "L) | fails: "
+        << fail_up << " UP " << fail_dn << " DN, max_wasted=" << max_uncov_wasted << "L";
 }
 
 // ============================================================================
@@ -824,7 +861,15 @@ void MagmaTubeMap::compute_volumes(const std::vector<Layer*> &layers)
         // area in scaled^2 → mm^2: divide by 1e12 (SCALING_FACTOR^2)
         // volume = area_mm2 * layer_height
         double area_mm2 = total_area_scaled2 * SCALING_FACTOR * SCALING_FACTOR;
-        pair.volume_mm3 = area_mm2 * m_layer_height;
+        double tube_volume = area_mm2 * m_layer_height;
+
+        // Add window gap volume: the shared edge opening between paired cells.
+        // Window is approximately edge_length × line_width × window_height.
+        double edge_len = triangle_side_length(m_cell_spacing);
+        double window_height = m_window_spec.window_height_layers * m_layer_height;
+        double window_volume = edge_len * m_line_width * window_height;
+
+        pair.volume_mm3 = tube_volume + window_volume;
     }
 }
 

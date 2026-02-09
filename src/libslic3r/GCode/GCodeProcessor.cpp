@@ -5458,57 +5458,69 @@ void GCodeProcessor::process_filament_change(int id)
 void GCodeProcessor::store_move_vertex(EMoveType type, EMovePathType path_type, bool internal_only)
 {
     // Intercept Magma injection extrusions when tube viz data is pending.
-    // Replace the single stationary extrusion with synthetic vertices
-    // tracing the U-tube spiral path for preview rendering.
+    // Each G1 E command from the split injection maps to one tube segment.
+    // On the first G1, we emit a start vertex (E=0) plus the first segment
+    // endpoint.  Each subsequent G1 emits one more segment endpoint.
+    // Because each G1 has its own line_id, the sequential slider steps
+    // through tube segments individually, showing progressive fill.
     if (m_pending_tube_viz.active &&
         type == EMoveType::Extrude &&
         m_extrusion_role == erMagmaInjection) {
 
+        auto& tube = m_pending_tube_viz;
         int filament_id = get_filament_id();
         m_last_line_id = m_line_id;
 
-        float total_e = static_cast<float>(m_end_position[E] - m_start_position[E]);
-
-        // Waypoints are in lattice/model space.  The nozzle is currently at
-        // the injection point which corresponds to waypoints[0] in model
-        // space but m_end_position in G-code space.  Compute the delta to
-        // translate all waypoints from model → viewer coordinates.
-        // Normal vertex position formula (from store_move_vertex below):
-        //   Vec3f(m_end_position[X] + m_x_offset, m_end_position[Y] + m_y_offset,
-        //         m_end_position[Z] - m_z_offset) + m_extruder_offsets[filament_id]
-        float dx = static_cast<float>(m_end_position[X]) + static_cast<float>(m_x_offset)
-                   - m_pending_tube_viz.waypoints[0].x();
-        float dy = static_cast<float>(m_end_position[Y]) + static_cast<float>(m_y_offset)
-                   - m_pending_tube_viz.waypoints[0].y();
-        // Z offset: waypoint Z values are in model space (absolute Z from bed),
-        // same coordinate space as normal extrusion Z.  Only subtract
-        // m_z_offset (typically 0) to match the render-space convention.
-        // Do NOT use m_end_position[Z] here — it may be z-slammed during
-        // injection, but the tube geometry lives at the real layer heights.
-        float dz = -static_cast<float>(m_z_offset);
-
-        // Compute total path length for proportional E distribution
-        double total_len = 0;
-        for (size_t i = 1; i < m_pending_tube_viz.waypoints.size(); ++i)
-            total_len += (m_pending_tube_viz.waypoints[i] - m_pending_tube_viz.waypoints[i - 1]).norm();
-
-        // Compute mm3_per_mm for tube cross-section visualization.
-        // Stationary extrusion has m_mm3_per_mm=0, but the renderer uses this
-        // for volumetric rate coloring.  Use circular tube cross-section area.
-        float tube_w = m_pending_tube_viz.width;
+        float seg_e = static_cast<float>(m_end_position[E] - m_start_position[E]);
+        float tube_w = tube.width;
         float tube_mm3_per_mm = static_cast<float>(M_PI / 4.0) * tube_w * tube_w;
 
-        for (size_t i = 0; i < m_pending_tube_viz.waypoints.size(); ++i) {
-            float seg_e = 0.f;
-            if (i > 0 && total_len > 0) {
-                float seg_len = (m_pending_tube_viz.waypoints[i] - m_pending_tube_viz.waypoints[i - 1]).norm();
-                seg_e = total_e * (seg_len / static_cast<float>(total_len));
-            }
+        // Compute model → viewer offsets on first encounter.
+        // waypoints[0] corresponds to the nozzle's current G-code position.
+        if (!tube.offsets_computed) {
+            tube.dx = static_cast<float>(m_end_position[X]) + static_cast<float>(m_x_offset)
+                      - tube.waypoints[0].x();
+            tube.dy = static_cast<float>(m_end_position[Y]) + static_cast<float>(m_y_offset)
+                      - tube.waypoints[0].y();
+            // Z: waypoints are absolute model Z; only subtract m_z_offset.
+            // Do NOT use m_end_position[Z] — may be z-slammed.
+            tube.dz = -static_cast<float>(m_z_offset);
+            tube.offsets_computed = true;
 
-            Vec3f pos(m_pending_tube_viz.waypoints[i].x() + dx,
-                      m_pending_tube_viz.waypoints[i].y() + dy,
-                      m_pending_tube_viz.waypoints[i].z() + dz);
+            // Emit start vertex at waypoints[0] with E=0 (establishes path origin)
+            Vec3f pos0(tube.waypoints[0].x() + tube.dx,
+                       tube.waypoints[0].y() + tube.dy,
+                       tube.waypoints[0].z() + tube.dz);
+            m_result.moves.push_back({
+                m_last_line_id,
+                EMoveType::Extrude,
+                erMagmaInjection,
+                static_cast<unsigned char>(filament_id),
+                m_cp_color.current,
+                pos0 + m_extruder_offsets[filament_id],
+                0.f,                                // E=0 start position
+                m_feedrate,
+                0.0f,
+                tube_w, tube_w,
+                tube_mm3_per_mm,
+                0.0f,
+                m_fan_speed,
+                m_extruder_temps[filament_id],
+                { 0.0f, 0.0f },
+                static_cast<float>(m_layer_id),
+                std::max<unsigned int>(1, m_layer_id) - 1,
+                internal_only,
+                m_object_label_id,
+                m_print_z
+            });
+            tube.cursor = 1;
+        }
 
+        // Emit next segment endpoint
+        if (tube.cursor < tube.waypoints.size()) {
+            Vec3f pos(tube.waypoints[tube.cursor].x() + tube.dx,
+                      tube.waypoints[tube.cursor].y() + tube.dy,
+                      tube.waypoints[tube.cursor].z() + tube.dz);
             m_result.moves.push_back({
                 m_last_line_id,
                 EMoveType::Extrude,
@@ -5519,10 +5531,9 @@ void GCodeProcessor::store_move_vertex(EMoveType type, EMovePathType path_type, 
                 seg_e,
                 m_feedrate,
                 0.0f,
-                tube_w,                             // width: circular cross-section
-                tube_w,                             // height == width
+                tube_w, tube_w,
                 tube_mm3_per_mm,
-                0.0f,                               // travel_dist
+                0.0f,
                 m_fan_speed,
                 m_extruder_temps[filament_id],
                 { 0.0f, 0.0f },
@@ -5532,9 +5543,13 @@ void GCodeProcessor::store_move_vertex(EMoveType type, EMovePathType path_type, 
                 m_object_label_id,
                 m_print_z
             });
+            tube.cursor++;
         }
 
-        m_pending_tube_viz.reset();
+        // Reset when all waypoints consumed
+        if (tube.cursor >= tube.waypoints.size())
+            tube.reset();
+
         // Do NOT update m_end_position — processor continues from real nozzle position
         return;
     }
