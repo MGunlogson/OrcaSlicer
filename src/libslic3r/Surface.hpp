@@ -28,6 +28,13 @@ enum SurfaceType {
     stInternalVoid,
     // Inner/outer perimeters.
     stPerimeter,
+    // Dual infill zone surface types
+    // Outer zone filled with Magma Triangle U-tube pattern
+    stZoneOuter,
+    // Zone floor (no zone infill below) - propagates solid upward into zone
+    stZoneFloor,
+    // Zone ceiling (no zone infill above) - propagates solid downward into zone
+    stZoneCeiling,
     // Number of SurfaceType enums.
     stCount,
 };
@@ -109,8 +116,16 @@ public:
     bool   is_internal_bridge() const { return this->surface_type == stInternalBridge; }
 	bool   is_external() const { return this->is_top() || this->is_bottom(); }
 	bool   is_internal() const { return ! this->is_external(); }
-	bool   is_solid()    const { return this->is_external() || this->surface_type == stInternalSolid || this->surface_type == stInternalBridge; }
+	// stZoneOuter is solid: injection fills tubes before the next layer prints.
+	// Unfilled cells are subtracted separately in PrintObject (bridge/sparse detection).
+	bool   is_solid()    const { return this->is_external() || this->surface_type == stInternalSolid || this->surface_type == stInternalBridge || this->is_zone_boundary() || this->is_zone_outer(); }
 	bool   is_solid_infill() const { return this->surface_type == stInternalSolid; }
+    // Dual infill zone surface type helpers
+    bool   is_zone_outer() const { return this->surface_type == stZoneOuter; }
+    bool   is_zone_floor() const { return this->surface_type == stZoneFloor; }
+    bool   is_zone_ceiling() const { return this->surface_type == stZoneCeiling; }
+    bool   is_zone_boundary() const { return is_zone_floor() || is_zone_ceiling(); }
+    bool   is_zone()       const { return is_zone_outer() || is_zone_boundary(); }
 };
 
 typedef std::vector<Surface> Surfaces;

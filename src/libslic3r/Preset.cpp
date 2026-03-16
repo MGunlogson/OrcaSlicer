@@ -894,7 +894,13 @@ static std::vector<std::string> s_Preset_print_options {
     "seam_position", "staggered_inner_seams", "wall_sequence", "is_infill_first", "sparse_infill_density","fill_multiline", "sparse_infill_pattern", "lateral_lattice_angle_1", "lateral_lattice_angle_2", "infill_overhang_angle", "top_surface_pattern", "bottom_surface_pattern",
     "infill_direction", "solid_infill_direction", "counterbore_hole_bridging","infill_shift_step", "sparse_infill_rotate_template", "solid_infill_rotate_template", "symmetric_infill_y_axis","skeleton_infill_density", "infill_lock_depth", "skin_infill_depth", "skin_infill_density",
     "align_infill_direction_to_model", "extra_solid_infills",
-    "minimum_sparse_infill_area", "reduce_infill_retraction","internal_solid_infill_pattern","gap_fill_target",
+    "minimum_sparse_infill_area", "filter_narrow_sparse_infill", "minimum_sparse_infill_width", "reduce_infill_retraction","internal_solid_infill_pattern","gap_fill_target",
+     // Dual infill zones configuration
+     "dual_infill_enabled", "dual_infill_outer_width", "dual_infill_shell_walls", "dual_infill_shell_width", "dual_infill_min_inner_width",
+     "dual_infill_solid_layers", "dual_infill_solid_thickness", "dual_infill_outer_speed", "dual_infill_shell_speed", "dual_infill_floor_speed", "dual_infill_ceiling_speed", "dual_infill_outer_filament",
+     // Magma Triangle pattern-specific options
+     "magma_tube_width_mode", "magma_nozzle_outer_diameter", "magma_interior_width", "magma_window_height_mm", "magma_tube_height", "magma_boundary_dodge", "magma_tube_fill_factor", "magma_spiral_interlock", "magma_tube_solver_mode", "magma_solver_timeout",
+     "magma_injection_temp", "magma_injection_speed", "magma_iron_tube_ends", "magma_ironing_flow", "magma_ironing_spacing", "magma_ironing_speed", "magma_injection_park", "magma_injection_park_z_hop", "magma_injection_park_retract", "magma_injection_z_slam", "magma_injection_dwell", "magma_injection_z_hop", "magma_injection_retract", "magma_injection_filament", "magma_overlap_line_correction", "magma_overlap_min_width",
     "ironing_type", "ironing_pattern", "ironing_flow", "ironing_speed", "ironing_spacing", "ironing_angle", "ironing_angle_fixed", "ironing_inset",
     "support_ironing", "support_ironing_pattern", "support_ironing_flow", "support_ironing_spacing",
     "max_travel_detour_distance",
@@ -915,7 +921,7 @@ static std::vector<std::string> s_Preset_print_options {
     "support_top_z_distance", "support_on_build_plate_only","support_critical_regions_only", "bridge_no_support", "thick_bridges", "thick_internal_bridges","dont_filter_internal_bridges","enable_extra_bridge_layer", "max_bridge_length", "print_sequence", "print_order", "support_remove_small_overhang",
     "filename_format", "wall_filament", "support_bottom_z_distance",
     "sparse_infill_filament", "solid_infill_filament", "support_filament", "support_interface_filament","support_interface_not_for_body",
-    "ooze_prevention", "standby_temperature_delta", "preheat_time","preheat_steps", "interface_shells", "line_width", "initial_layer_line_width", "inner_wall_line_width",
+    "ooze_prevention", "ooze_prevention_park", "ooze_prevention_park_z_hop", "ooze_prevention_park_retract", "standby_temperature_delta", "preheat_time","preheat_steps", "interface_shells", "line_width", "initial_layer_line_width", "inner_wall_line_width",
     "outer_wall_line_width", "sparse_infill_line_width", "internal_solid_infill_line_width",
     "skin_infill_line_width","skeleton_infill_line_width",
     "top_surface_line_width", "support_line_width", "infill_wall_overlap","top_bottom_infill_wall_overlap", "bridge_flow", "internal_bridge_flow",
@@ -981,6 +987,7 @@ static std::vector<std::string> s_Preset_filament_options {/*"filament_colour", 
     //SoftFever
     "enable_pressure_advance", "pressure_advance","adaptive_pressure_advance","adaptive_pressure_advance_model","adaptive_pressure_advance_overhangs", "adaptive_pressure_advance_bridges","chamber_temperature", "filament_shrink","filament_shrinkage_compensation_z", "support_material_interface_fan_speed","internal_bridge_fan_speed", "filament_notes" /*,"filament_seam_gap"*/,
     "ironing_fan_speed",
+    "magma_injection_fan_speed",
     // Filament ironing overrides
     "filament_ironing_flow", "filament_ironing_spacing", "filament_ironing_inset", "filament_ironing_speed",
     "filament_loading_speed", "filament_loading_speed_start",

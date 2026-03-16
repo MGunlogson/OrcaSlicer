@@ -37,11 +37,15 @@ const char* surface_type_to_color_name(const SurfaceType surface_type)
         case stTop:             return "rgb(255,0,0)"; // "red";
         case stBottom:          return "rgb(0,255,0)"; // "green";
         case stBottomBridge:    return "rgb(0,0,255)"; // "blue";
-        case stInternal:        return "rgb(255,255,128)"; // yellow 
+        case stInternal:        return "rgb(255,255,128)"; // yellow
         case stInternalSolid:   return "rgb(255,0,255)"; // magenta
         case stInternalBridge:  return "rgb(0,255,255)";
         case stInternalVoid:    return "rgb(128,128,128)";
         case stPerimeter:       return "rgb(128,0,0)"; // maroon
+        // Dual infill zone surface types
+        case stZoneOuter:   return "rgb(255,165,0)"; // orange
+        case stZoneFloor:   return "rgb(255,140,0)"; // darkorange
+        case stZoneCeiling: return "rgb(255,127,80)"; // coral
         default:                return "rgb(64,64,64)";
     };
 }

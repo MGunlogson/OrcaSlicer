@@ -159,6 +159,8 @@ set(lisbslic3r_sources
     Fill/FillLightning.hpp
     Fill/FillLine.cpp
     Fill/FillLine.hpp
+    Fill/FillMagma.cpp
+    Fill/FillMagma.hpp
     Fill/FillPlanePath.cpp
     Fill/FillPlanePath.hpp
     Fill/FillRectilinear.cpp
@@ -218,6 +220,8 @@ set(lisbslic3r_sources
     GCode/FanMover.hpp
     GCode/GCodeProcessor.cpp
     GCode/GCodeProcessor.hpp
+    GCode/SafeParkPosition.cpp
+    GCode/SafeParkPosition.hpp
     GCode.hpp
     GCode/PchipInterpolatorHelper.cpp
     GCode/PchipInterpolatorHelper.hpp
@@ -283,6 +287,20 @@ set(lisbslic3r_sources
     Line.hpp
     LocalesUtils.cpp
     LocalesUtils.hpp
+    ZoneBoundary/ZoneInterior.cpp
+    ZoneBoundary/ZoneInterior.hpp
+    Magma/MagmaTriangleCell.cpp
+    Magma/MagmaTriangleCell.hpp
+    Magma/MagmaSpiralOffset.cpp
+    Magma/MagmaSpiralOffset.hpp
+    Magma/MagmaTubeMap.cpp
+    Magma/MagmaTubeMap.hpp
+    Magma/MagmaInjection.cpp
+    Magma/MagmaInjection.hpp
+    Magma/MagmaTubeSolver.cpp
+    Magma/MagmaTubeSolver.hpp
+    Magma/MagmaGreedyWarmStart.cpp
+    Magma/MagmaGreedyWarmStart.hpp
     MarchingSquares.hpp
     Measure.cpp
     Measure.hpp
@@ -377,6 +395,7 @@ set(lisbslic3r_sources
     SLA/Concurrency.hpp
     SLA/Hollowing.cpp
     SLA/Hollowing.hpp
+    SLA/Interior.hpp
     SLA/IndexedMesh.cpp
     SLA/IndexedMesh.hpp
     SLA/JobController.hpp
@@ -595,6 +614,7 @@ target_link_libraries(libslic3r
         semver
         TBB::tbb
         TBB::tbbmalloc
+        ortools::ortools
         ZLIB::ZLIB
         OpenSSL::Crypto
     )
