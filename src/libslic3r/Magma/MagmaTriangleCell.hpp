@@ -221,8 +221,8 @@ private:
 
 // Window specification for U-tube formation.
 // Windows are gaps in the shared walls between paired cells that create
-// connected U-tubes. Stagger period (see MagmaTubeMap::m_stagger_period)
-// clusters tube boundaries at regular intervals while avoiding weak planes.
+// connected U-tubes. Boundary dodge (see MagmaTubeMap::m_dodge_distance)
+// prevents horizontal weak planes by staggering tube boundaries.
 //
 // All boundaries are checked in mm (via window_end_z on each UTubePair),
 // so variable layer height works correctly.

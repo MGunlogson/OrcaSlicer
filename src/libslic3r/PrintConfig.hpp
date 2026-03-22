@@ -1064,7 +1064,6 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionBool,                 magma_injection_retract))      // Retract after each injection
     ((ConfigOptionEnum<MagmaTubeSolverMode>, magma_tube_solver_mode))   // Basic (fast) vs Refined (better coverage)
     ((ConfigOptionFloat,                magma_solver_timeout))         // CP-SAT timeout per block in seconds
-    ((ConfigOptionInt,                  magma_stagger_tolerance_pct))   // Max extra tubes for stagger as percentage (0-50%)
     ((ConfigOptionEnum<MagmaInjectionEdgePref>, magma_injection_edge_pref))  // Injection position: interior or exterior
 
     // Orca: internal use only
@@ -1258,7 +1257,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloat,                magma_interior_width))         // Cell hole size (mm), 0 = auto
     ((ConfigOptionFloat,                magma_window_height_mm))       // Window gap height (mm), 0 = auto
     ((ConfigOptionFloat,                magma_tube_height))            // Tube height in mm
-    ((ConfigOptionFloat,                magma_stagger_period))         // Stagger grid period in mm (0 = auto: max_tube_height/3)
+    ((ConfigOptionFloat,                magma_boundary_dodge))         // Boundary dodge distance in mm (0 = auto: 4x max_layer_height)
     ((ConfigOptionBool,                 magma_spiral_interlock))       // Enable spiral interlock between layers
     ((ConfigOptionBool,                 magma_overlap_line_correction)) // Reduce line width for vertex overlap
     ((ConfigOptionPercent,              magma_overlap_min_width))       // Min line width as % of nozzle (0 = auto 90%)

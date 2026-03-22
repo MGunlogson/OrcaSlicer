@@ -5342,20 +5342,19 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(10));
 
-    def = this->add("magma_stagger_period", coFloat);
-    def->label = L("Stagger period");
+    def = this->add("magma_boundary_dodge", coFloat);
+    def->label = L("Weak plane avoidance");
     def->category = L("Strength");
-    def->tooltip = L("Z-interval at which tube boundaries are encouraged to cluster. "
-                     "Boundaries are pulled toward evenly-spaced heights at this interval, "
-                     "reducing the number of distinct injection layers \u2014 fewer temperature "
-                     "change cycles when injection uses a different temperature.\n\n"
-                     "Neighboring cells are also discouraged from having boundaries at the "
-                     "same height (weak plane avoidance).\n\n"
-                     "0 = auto (max tube height \u00f7 3). Larger values produce fewer stagger "
-                     "levels. Set to a very small value to effectively disable clustering.");
+    def->tooltip = L("Minimum Z-separation between tube boundaries on neighboring cells. "
+                     "When multiple tubes end at the same height, they create a horizontal "
+                     "\"weak plane\" \u2014 a continuous layer where the part has less reinforcement. "
+                     "This setting spreads tube boundaries apart to avoid weak planes.\n\n"
+                     "Larger values spread boundaries further apart but may reduce tube height "
+                     "in constrained spaces. Only used in Refined solver mode.\n\n"
+                     "0 = auto (4 x max layer height). Set to a very small value to effectively disable.");
     def->sidetext = L("mm");
     def->min = 0;
-    def->max = 100;
+    def->max = 20;
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(0));
 
@@ -5466,21 +5465,6 @@ void PrintConfigDef::init_fff_params()
     def->max = 120;
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(10));
-
-    def = this->add("magma_stagger_tolerance_pct", coInt);
-    def->label = L("Stagger tolerance");
-    def->category = L("Strength");
-    def->tooltip = L("How aggressively the solver creates extra shorter tubes for stagger "
-                     "alignment, as a percentage. Higher values produce better weak-plane "
-                     "avoidance at the cost of slightly shorter average tube length.\n\n"
-                     "0% = no extra tubes (stagger only when it also improves fill)\n"
-                     "10% = mild stagger (default)\n"
-                     "50% = aggressive stagger");
-    def->sidetext = L("%");
-    def->min = 0;
-    def->max = 50;
-    def->mode = comAdvanced;
-    def->set_default_value(new ConfigOptionInt(20));
 
     def = this->add("magma_ironing_speed", coFloat);
     def->label = L("Magma ironing speed");

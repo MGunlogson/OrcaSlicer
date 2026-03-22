@@ -208,7 +208,6 @@ std::unique_ptr<MagmaTubeMap> MagmaTubeMap::build(
     map->m_dual_infill_enabled = config.dual_infill_enabled.value;
     map->m_solver_mode    = obj_config.magma_tube_solver_mode.value;
     map->m_solver_timeout = obj_config.magma_solver_timeout.value;
-    map->m_stagger_tolerance_pct = obj_config.magma_stagger_tolerance_pct.value;
 
     // Build per-layer height/z tables for adaptive layer height support.
     // Must happen before WindowSpec and spiral params since they use m_min_layer_height.
@@ -278,14 +277,18 @@ std::unique_ptr<MagmaTubeMap> MagmaTubeMap::build(
         }
     }
 
-    // Stagger period: Z-interval for boundary clustering.
-    // Auto (0): max_tube_height / 3 — three stagger levels per tube height.
+    // Boundary dodge distance: how far apart adjacent tube boundaries should be (mm).
+    // Auto (0): 4 × max_layer_height. Ensures at least 4 solid layers bridging
+    // each boundary discontinuity. Natural 3-level stagger from triangle lattice.
     {
-        double user_period = config.magma_stagger_period.value;
-        if (user_period <= 0.0)
-            map->m_stagger_period = map->m_max_tube_height_mm / 3.0;
-        else
-            map->m_stagger_period = user_period;
+        double user_dodge = config.magma_boundary_dodge.value;
+        if (user_dodge <= 0.0) {
+            double max_lh = slicing_params.max_layer_height;
+            if (max_lh <= 0.0) max_lh = double(map->m_layer_height);
+            map->m_dodge_distance = 4.0 * max_lh;
+        } else {
+            map->m_dodge_distance = user_dodge;
+        }
     }
 
     // Build per-layer lattice cache (eliminates repeated sin/cos + TriangleLattice construction)
@@ -376,7 +379,7 @@ std::unique_ptr<MagmaTubeMap> MagmaTubeMap::build(
         << map->num_pairs() << " pairs, "
         << map->num_solid_cells() << " solid | "
         << "max_tube_height=" << map->m_max_tube_height_mm << "mm"
-        << " stagger_period=" << map->m_stagger_period << "mm";
+        << " dodge=" << map->m_dodge_distance << "mm";
 
     return map;
 }
@@ -576,9 +579,8 @@ void MagmaTubeMap::assign_tubes(ProgressFn progress_fn, ThrowIfCanceled throw_if
 {
     MagmaTubeSolver solver(m_cells, m_layer_data,
                            m_min_tube_height_mm, m_max_tube_height_mm,
-                           m_num_layers, m_stagger_period,
-                           m_solver_mode, m_solver_timeout,
-                           m_stagger_tolerance_pct);
+                           m_num_layers, m_dodge_distance,
+                           m_solver_mode, m_solver_timeout);
     solver.solve(m_pairs, m_cell_pair_index, progress_fn, throw_if_canceled);
 
     if (solver.unknown_block_count() > 0 && m_warning_message.empty()) {

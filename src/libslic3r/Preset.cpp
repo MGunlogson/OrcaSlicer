@@ -899,7 +899,7 @@ static std::vector<std::string> s_Preset_print_options {
      "dual_infill_enabled", "dual_infill_outer_width", "dual_infill_shell_walls", "dual_infill_shell_width", "dual_infill_min_inner_width",
      "dual_infill_solid_layers", "dual_infill_solid_thickness", "dual_infill_outer_speed", "dual_infill_shell_speed", "dual_infill_floor_speed", "dual_infill_ceiling_speed", "dual_infill_outer_filament",
      // Magma Triangle pattern-specific options
-     "magma_tube_width_mode", "magma_nozzle_outer_diameter", "magma_interior_width", "magma_window_height_mm", "magma_tube_height", "magma_stagger_period", "magma_tube_fill_factor", "magma_spiral_interlock", "magma_tube_solver_mode", "magma_solver_timeout", "magma_stagger_tolerance_pct",
+     "magma_tube_width_mode", "magma_nozzle_outer_diameter", "magma_interior_width", "magma_window_height_mm", "magma_tube_height", "magma_boundary_dodge", "magma_tube_fill_factor", "magma_spiral_interlock", "magma_tube_solver_mode", "magma_solver_timeout",
      "magma_injection_temp", "magma_injection_speed", "magma_iron_tube_ends", "magma_ironing_flow", "magma_ironing_spacing", "magma_ironing_speed", "magma_injection_park", "magma_injection_park_z_hop", "magma_injection_park_retract", "magma_injection_z_slam", "magma_injection_dwell", "magma_injection_z_hop", "magma_injection_retract", "magma_injection_filament", "magma_overlap_line_correction", "magma_overlap_min_width",
     "ironing_type", "ironing_pattern", "ironing_flow", "ironing_speed", "ironing_spacing", "ironing_angle", "ironing_angle_fixed", "ironing_inset",
     "support_ironing", "support_ironing_pattern", "support_ironing_flow", "support_ironing_spacing",

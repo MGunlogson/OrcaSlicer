@@ -202,14 +202,13 @@ private:
     float  m_line_width;
     float  m_layer_height;            // nominal config layer height (fallback)
     float  m_min_layer_height;        // smallest layer height in the object
-    double m_stagger_period;          // stagger grid period in mm (0 = disabled)
+    double m_dodge_distance;          // boundary dodge distance in mm (stagger target)
     double m_max_tube_height_mm;      // max tube height in mm (drives boundary placement)
     double m_min_tube_height_mm;      // min tube height in mm
     int    m_num_layers;
     bool   m_dual_infill_enabled;
     MagmaTubeSolverMode m_solver_mode = MagmaTubeSolverMode::Refined;
     double m_solver_timeout = 20.0;
-    int m_stagger_tolerance_pct = 20; // stagger tolerance percentage (0-50)
     MagmaInjectionEdgePref m_injection_edge_pref = MagmaInjectionEdgePref::Interior;
 
     // Triangle vertex overlap correction

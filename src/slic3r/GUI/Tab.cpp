@@ -2477,7 +2477,7 @@ void TabPrint::build()
         optgroup->append_single_option_line("magma_tube_fill_factor");
         optgroup->append_single_option_line("magma_tube_solver_mode");
         optgroup->append_single_option_line("magma_solver_timeout");
-        optgroup->append_single_option_line("magma_stagger_period");
+        optgroup->append_single_option_line("magma_boundary_dodge");
 
         optgroup = page->new_optgroup(L("Magma Injection"), L"param_magmainjection");
         optgroup->append_single_option_line("magma_injection_temp");

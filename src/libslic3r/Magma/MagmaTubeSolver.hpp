@@ -141,10 +141,9 @@ public:
         double min_tube_height_mm,
         double max_tube_height_mm,
         int    num_layers,
-        double stagger_period_mm = 0.0,
+        double dodge_distance_mm = 0.0,
         MagmaTubeSolverMode mode = MagmaTubeSolverMode::Refined,
-        double solver_timeout_sec = 20.0,
-        int    stagger_tolerance_pct = 20);
+        double solver_timeout_sec = 20.0);
 
     /// Run the solver. Populates out_pairs and out_cell_pair_index.
     void solve(
@@ -185,10 +184,9 @@ private:
     double m_max_h_mm;
     int    m_num_layers;
     int    m_z_window; // Z block size in layers
-    double m_stagger_period_mm; // stagger grid period (0 = disabled)
+    double m_dodge_mm; // boundary dodge distance (0 = stagger disabled)
     MagmaTubeSolverMode m_mode;
     double m_timeout_sec;
-    int    m_stagger_tolerance_pct; // tube budget tolerance for stagger (0-50%)
 
     // Pre-computed
     MicronTables                                            m_um;
@@ -203,7 +201,7 @@ private:
 
     // Per-cell per-layer difficulty from greedy's initial unconstrained scoring.
     // 0 = easiest (3 neighbors at max_h), 3×max_h_um = hardest (no neighbors).
-    // Used by solve_block to decide grid domain restriction per run.
+    // Kept for future use (not currently used for domain restriction).
     std::unordered_map<TriangleCell, std::vector<int64_t>, TriangleCellHash> m_cell_difficulty;
 
     // Constants

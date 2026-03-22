@@ -1392,7 +1392,7 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "magma_interior_width"
             || opt_key == "magma_window_height_mm"
             || opt_key == "magma_tube_height"
-            || opt_key == "magma_stagger_period"
+            || opt_key == "magma_boundary_dodge"
             || opt_key == "magma_tube_solver_mode"
             || opt_key == "magma_solver_timeout"
             || opt_key == "magma_spiral_interlock"
