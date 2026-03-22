@@ -5467,6 +5467,21 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(10));
 
+    def = this->add("magma_stagger_tolerance_pct", coInt);
+    def->label = L("Stagger tolerance");
+    def->category = L("Strength");
+    def->tooltip = L("How aggressively the solver creates extra shorter tubes for stagger "
+                     "alignment, as a percentage. Higher values produce better weak-plane "
+                     "avoidance at the cost of slightly shorter average tube length.\n\n"
+                     "0% = no extra tubes (stagger only when it also improves fill)\n"
+                     "10% = mild stagger (default)\n"
+                     "50% = aggressive stagger");
+    def->sidetext = L("%");
+    def->min = 0;
+    def->max = 50;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionInt(20));
+
     def = this->add("magma_ironing_speed", coFloat);
     def->label = L("Magma ironing speed");
     def->category = L("Strength");

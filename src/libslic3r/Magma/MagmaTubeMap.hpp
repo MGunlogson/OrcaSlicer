@@ -209,6 +209,7 @@ private:
     bool   m_dual_infill_enabled;
     MagmaTubeSolverMode m_solver_mode = MagmaTubeSolverMode::Refined;
     double m_solver_timeout = 20.0;
+    int m_stagger_tolerance_pct = 20; // stagger tolerance percentage (0-50)
     MagmaInjectionEdgePref m_injection_edge_pref = MagmaInjectionEdgePref::Interior;
 
     // Triangle vertex overlap correction

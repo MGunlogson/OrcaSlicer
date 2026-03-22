@@ -143,7 +143,8 @@ public:
         int    num_layers,
         double stagger_period_mm = 0.0,
         MagmaTubeSolverMode mode = MagmaTubeSolverMode::Refined,
-        double solver_timeout_sec = 20.0);
+        double solver_timeout_sec = 20.0,
+        int    stagger_tolerance_pct = 20);
 
     /// Run the solver. Populates out_pairs and out_cell_pair_index.
     void solve(
@@ -151,6 +152,10 @@ public:
         std::unordered_map<TriangleCell, std::vector<int>, TriangleCellHash> &out_cell_pair_index,
         ProgressFn progress_fn = nullptr,
         ThrowIfCanceled throw_if_canceled = nullptr);
+
+    /// Number of blocks that returned UNKNOWN (no solution found within timeout).
+    /// Greedy solution is preserved for these blocks.
+    int unknown_block_count() const { return m_unknown_blocks; }
 
 private:
     // Pre-computation
@@ -183,6 +188,7 @@ private:
     double m_stagger_period_mm; // stagger grid period (0 = disabled)
     MagmaTubeSolverMode m_mode;
     double m_timeout_sec;
+    int    m_stagger_tolerance_pct; // tube budget tolerance for stagger (0-50%)
 
     // Pre-computed
     MicronTables                                            m_um;
@@ -193,13 +199,16 @@ private:
 
     // Committed assignments (updated between passes)
     std::vector<std::vector<CommittedSegment>> m_committed; // indexed by edge idx
+    int m_unknown_blocks = 0; // blocks that timed out with no solution
 
-    // Cancellation: checked between passes. Mid-solve abort not yet wired.
+    // Per-cell per-layer difficulty from greedy's initial unconstrained scoring.
+    // 0 = easiest (3 neighbors at max_h), 3×max_h_um = hardest (no neighbors).
+    // Used by solve_block to decide grid domain restriction per run.
+    std::unordered_map<TriangleCell, std::vector<int64_t>, TriangleCellHash> m_cell_difficulty;
 
     // Constants
     static constexpr int    R              = 4;
     static constexpr int    CPSAT_WORKERS  = 8;
-    static constexpr int    MAX_K          = 4;
 };
 
 } // namespace magma

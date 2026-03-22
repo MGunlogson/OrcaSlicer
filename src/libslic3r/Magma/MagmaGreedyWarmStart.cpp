@@ -12,6 +12,32 @@ namespace Slic3r {
 namespace magma {
 
 // ============================================================================
+// Greedy Warm Start — design rationale
+// ============================================================================
+//
+// WHY GREEDY BEFORE CP-SAT:
+// CP-SAT with a warm start converges much faster than cold start. The greedy
+// heuristic produces ~77-81% coverage in milliseconds, giving CP-SAT a strong
+// initial solution. Without it, CP-SAT blocks often time out at UNKNOWN with
+// poor solutions because the search space is too large to explore from scratch
+// within the per-block timeout.
+//
+// WHY MOST-CONSTRAINED-FIRST:
+// Cells at object boundaries have fewer neighbors (1 vs 3 for interior cells).
+// If interior cells are processed first, they consume all available Z ranges,
+// leaving boundary cells stranded with no valid pairing. Processing the most
+// constrained cells first (fewest/shortest tube options) prevents stranding.
+// This is the classic CSP heuristic for reducing backtracking, applied greedily.
+//
+// WHY NO STAGGER:
+// The greedy stage produces the longest possible tubes with no stagger logic.
+// "Natural stagger" from the priority ordering is incidental — it's not designed
+// or guaranteed. Stagger is the CP-SAT stage's responsibility: the domain
+// restriction gives the solver grid-aligned boundary options that greedy never
+// used, allowing it to shorten some tubes for better boundary alignment.
+//
+
+// ============================================================================
 // CellConsumed — tracks consumed Z-ranges per cell (sorted, non-overlapping)
 // ============================================================================
 
@@ -76,6 +102,34 @@ const Run *find_run_containing(const EdgeData &ed, int layer, int64_t bottom_um,
     return nullptr;
 }
 
+// Expand a tube centered on center_layer to its maximum valid extent.
+// Expands downward then upward within the run, stopping at consumed
+// intervals, max_h_um, or run boundaries. Returns (start_um, end_um).
+std::pair<int64_t, int64_t> expand_tube(
+    int center_layer, const Run &run,
+    const CellConsumed &consumed_a, const CellConsumed &consumed_b,
+    const MicronTables &um, int64_t max_h_um)
+{
+    int64_t tube_start = um.bottom_um[center_layer];
+    int64_t tube_end   = um.top_um[center_layer];
+
+    for (int lo = center_layer - 1; lo >= run.start_layer; --lo) {
+        int64_t bot = um.bottom_um[lo];
+        int64_t top = um.top_um[lo];
+        if (tube_end - bot > max_h_um) break;
+        if (consumed_a.overlaps(bot, top) || consumed_b.overlaps(bot, top)) break;
+        tube_start = bot;
+    }
+    for (int hi = center_layer + 1; hi <= run.end_layer; ++hi) {
+        int64_t bot = um.bottom_um[hi];
+        int64_t top = um.top_um[hi];
+        if (top - tube_start > max_h_um) break;
+        if (consumed_a.overlaps(bot, top) || consumed_b.overlaps(bot, top)) break;
+        tube_end = top;
+    }
+    return {tube_start, tube_end};
+}
+
 // Count unconsumed layers in a run for a given cell
 int count_unconsumed_layers(const Run &run,
                             const CellConsumed &consumed_a,
@@ -105,29 +159,94 @@ void greedy_warm_start(
     const MicronTables                                                      &um,
     int64_t min_h_um,
     int64_t max_h_um,
-    std::vector<std::vector<CommittedSegment>>                              &committed)
+    std::vector<std::vector<CommittedSegment>>                              &committed,
+    CellDifficultyMap                                                       *out_difficulty)
 {
     auto t_start = std::chrono::high_resolution_clock::now();
 
     // Consumed intervals per cell
     std::unordered_map<TriangleCell, CellConsumed, TriangleCellHash> consumed;
 
+    // ------------------------------------------------------------------
+    // Difficulty map: per-cell per-layer score of neighborhood flexibility.
+    //
+    // Computed BEFORE any assignments (consumed is empty) so it captures the
+    // unconstrained potential of each cell×layer. The CP-SAT solver uses this
+    // to decide which runs are safe for grid domain restriction (stagger):
+    // easy neighborhoods get restricted, hard ones keep full domains.
+    //
+    // Score = sum of achievable tube heights across all neighbors (same as
+    // build_heap below). Inverted to difficulty: 0 = easiest, higher = harder.
+    //   difficulty = max_possible - score
+    //   max_possible = 3 × max_h_um  (3 neighbors, each offering max height)
+    // ------------------------------------------------------------------
+    if (out_difficulty) {
+        const int64_t max_possible = 3 * max_h_um;
+        CellConsumed empty_consumed; // empty — unconstrained baseline
+
+        for (const auto &[cell, presence] : cells) {
+            auto ce_it = cell_edges.find(cell);
+            if (ce_it == cell_edges.end()) continue;
+
+            auto &diff_vec = (*out_difficulty)[cell];
+            diff_vec.assign(presence.last_layer - presence.first_layer + 1, max_possible);
+
+            for (int L = presence.first_layer; L <= presence.last_layer; ++L) {
+                if (!presence.present(L)) continue;
+
+                int64_t layer_bot = um.bottom_um[L];
+                int64_t layer_top = um.top_um[L];
+                double score = 0.0;
+
+                for (size_t ei : ce_it->second) {
+                    const EdgeData &ed = edges[ei];
+                    const Run *run = find_run_containing(ed, L, layer_bot, layer_top);
+                    if (!run) continue;
+
+                    auto [tube_start, tube_end] = expand_tube(
+                        L, *run, empty_consumed, empty_consumed, um, max_h_um);
+                    int64_t potential = tube_end - tube_start;
+                    if (potential >= min_h_um)
+                        score += double(potential);
+                }
+
+                int64_t difficulty = max_possible - llround(score);
+                if (difficulty < 0) {
+                    BOOST_LOG_TRIVIAL(warning) << "MagmaGreedy: score " << llround(score)
+                        << " exceeds max_possible " << max_possible
+                        << " for cell(" << cell.a << "," << cell.b << ") layer " << L;
+                    difficulty = 0;
+                }
+                diff_vec[L - presence.first_layer] = difficulty;
+            }
+        }
+    }
+
     using MinHeap = std::priority_queue<CellLayerScore, std::vector<CellLayerScore>,
                                          std::greater<CellLayerScore>>;
 
-    // Periodic re-scoring interval. As tubes are assigned, the heap ordering
-    // becomes stale (cell×layers that were "easy" may now be constrained).
-    // Rebuilding the heap periodically corrects the priority ordering so the
-    // most-constrained-first heuristic stays effective. Scaled by model size:
-    // num_edges roughly tracks complexity, /3 gives ~3 re-scores during the
-    // main assignment wave. Floor of 200 prevents churn on tiny models.
+    // Periodic re-scoring interval. As tubes are assigned, heap entries become
+    // stale — cell×layers that were "easy" (high score) may now be constrained
+    // because their neighbors were consumed. Rebuilding the heap periodically
+    // corrects the priority ordering so most-constrained-first stays effective.
+    //
+    // Tradeoff: too frequent = wasted time rebuilding heaps (O(cells × layers ×
+    // edges per cell)). Too infrequent = stale priorities cause suboptimal
+    // assignments (easy cells processed before hard ones, leading to stranding).
+    // The edges/3 heuristic triggers ~3-10 re-scores during the main assignment
+    // wave, empirically balancing quality and speed. Floor of 200 prevents churn
+    // on tiny models where each rebuild is cheap anyway.
     const int rescore_every = std::max(200, static_cast<int>(edges.size()) / 3);
 
     // ------------------------------------------------------------------
     // Build heap: score unconsumed cell×layers
     // ------------------------------------------------------------------
-    // Score = sum of achievable tube heights across all unconsumed neighbors.
-    // Lower score = fewer/shorter options = more constrained = higher priority.
+    // Score = sum of achievable tube heights across all unconsumed neighbors
+    // for this cell×layer. This is a direct measure of "remaining flexibility":
+    //   - Lower score → fewer/shorter options → more likely to become stranded
+    //     if not processed soon → higher priority (min-heap)
+    //   - A cell×layer with only 1 short neighbor option is more constrained
+    //     than one with 3 neighbors each offering max-height tubes
 
     auto build_heap = [&]() -> MinHeap {
         MinHeap heap;
@@ -155,26 +274,8 @@ void greedy_warm_start(
                         (ed.edge.a == cell) ? ed.edge.b : ed.edge.a;
                     if (consumed[neighbor].overlaps(layer_bot, layer_top)) continue;
 
-                    int64_t tube_start = layer_bot;
-                    int64_t tube_end   = layer_top;
-                    const CellConsumed &cons_c = consumed[cell];
-                    const CellConsumed &cons_n = consumed[neighbor];
-
-                    for (int lo = L - 1; lo >= run->start_layer; --lo) {
-                        int64_t bot = um.bottom_um[lo];
-                        if (tube_end - bot > max_h_um) break;
-                        if (cons_c.overlaps(bot, um.top_um[lo]) ||
-                            cons_n.overlaps(bot, um.top_um[lo])) break;
-                        tube_start = bot;
-                    }
-                    for (int hi = L + 1; hi <= run->end_layer; ++hi) {
-                        int64_t top = um.top_um[hi];
-                        if (top - tube_start > max_h_um) break;
-                        if (cons_c.overlaps(um.bottom_um[hi], top) ||
-                            cons_n.overlaps(um.bottom_um[hi], top)) break;
-                        tube_end = top;
-                    }
-
+                    auto [tube_start, tube_end] = expand_tube(
+                        L, *run, consumed[cell], consumed[neighbor], um, max_h_um);
                     int64_t potential = tube_end - tube_start;
                     if (potential >= min_h_um) {
                         fillable = true;
@@ -256,26 +357,9 @@ void greedy_warm_start(
         if (best_edge_idx == SIZE_MAX) continue;
 
         // Expand the longest valid tube containing this layer
-        int64_t tube_start = entry.layer_bottom_um;
-        int64_t tube_end   = entry.layer_top_um;
-        const CellConsumed &cons_a = consumed[entry.cell];
-        const CellConsumed &cons_b = consumed[best_neighbor];
-
-        for (int lo = entry.layer - 1; lo >= best_run->start_layer; --lo) {
-            int64_t bot = um.bottom_um[lo];
-            int64_t top = um.top_um[lo];
-            if (tube_end - bot > max_h_um) break;
-            if (cons_a.overlaps(bot, top) || cons_b.overlaps(bot, top)) break;
-            tube_start = bot;
-        }
-
-        for (int hi = entry.layer + 1; hi <= best_run->end_layer; ++hi) {
-            int64_t bot = um.bottom_um[hi];
-            int64_t top = um.top_um[hi];
-            if (top - tube_start > max_h_um) break;
-            if (cons_a.overlaps(bot, top) || cons_b.overlaps(bot, top)) break;
-            tube_end = top;
-        }
+        auto [tube_start, tube_end] = expand_tube(
+            entry.layer, *best_run,
+            consumed[entry.cell], consumed[best_neighbor], um, max_h_um);
 
         if (tube_end - tube_start < min_h_um) continue;
 
@@ -290,6 +374,9 @@ void greedy_warm_start(
             << " score=" << entry.score
             << " nbr_free=" << best_neighbor_free;
 
+        // Commit tube and mark both cells as consumed. No stagger logic here:
+        // greedy always picks the longest possible tube. CP-SAT will later
+        // re-optimize with grid-aligned boundary options for stagger.
         committed[best_edge_idx].push_back({tube_start, tube_end});
         consumed[entry.cell].add(tube_start, tube_end);
         consumed[best_neighbor].add(tube_start, tube_end);

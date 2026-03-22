@@ -208,6 +208,7 @@ std::unique_ptr<MagmaTubeMap> MagmaTubeMap::build(
     map->m_dual_infill_enabled = config.dual_infill_enabled.value;
     map->m_solver_mode    = obj_config.magma_tube_solver_mode.value;
     map->m_solver_timeout = obj_config.magma_solver_timeout.value;
+    map->m_stagger_tolerance_pct = obj_config.magma_stagger_tolerance_pct.value;
 
     // Build per-layer height/z tables for adaptive layer height support.
     // Must happen before WindowSpec and spiral params since they use m_min_layer_height.
@@ -576,8 +577,17 @@ void MagmaTubeMap::assign_tubes(ProgressFn progress_fn, ThrowIfCanceled throw_if
     MagmaTubeSolver solver(m_cells, m_layer_data,
                            m_min_tube_height_mm, m_max_tube_height_mm,
                            m_num_layers, m_stagger_period,
-                           m_solver_mode, m_solver_timeout);
+                           m_solver_mode, m_solver_timeout,
+                           m_stagger_tolerance_pct);
     solver.solve(m_pairs, m_cell_pair_index, progress_fn, throw_if_canceled);
+
+    if (solver.unknown_block_count() > 0 && m_warning_message.empty()) {
+        m_warning_message = Slic3r::format(
+            "Magma tube solver: %1% block(s) timed out without finding a solution. "
+            "Greedy results were preserved for those blocks. Increase solver timeout "
+            "for better coverage.",
+            solver.unknown_block_count());
+    }
 }
 
 // Old greedy PQ code deleted — replaced by MagmaTubeSolver (CP-SAT).

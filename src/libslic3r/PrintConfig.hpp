@@ -1064,6 +1064,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionBool,                 magma_injection_retract))      // Retract after each injection
     ((ConfigOptionEnum<MagmaTubeSolverMode>, magma_tube_solver_mode))   // Basic (fast) vs Refined (better coverage)
     ((ConfigOptionFloat,                magma_solver_timeout))         // CP-SAT timeout per block in seconds
+    ((ConfigOptionInt,                  magma_stagger_tolerance_pct))   // Max extra tubes for stagger as percentage (0-50%)
     ((ConfigOptionEnum<MagmaInjectionEdgePref>, magma_injection_edge_pref))  // Injection position: interior or exterior
 
     // Orca: internal use only

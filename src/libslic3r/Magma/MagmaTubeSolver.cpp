@@ -31,16 +31,17 @@ MagmaTubeSolver::MagmaTubeSolver(
     int    num_layers,
     double stagger_period_mm,
     MagmaTubeSolverMode mode,
-    double solver_timeout_sec)
+    double solver_timeout_sec,
+    int    stagger_tolerance_pct)
     : m_cells(cells)
     , m_layer_data(layer_data)
     , m_min_h_mm(min_tube_height_mm)
     , m_max_h_mm(max_tube_height_mm)
     , m_num_layers(num_layers)
-    , m_z_window(0)
     , m_stagger_period_mm(stagger_period_mm)
     , m_mode(mode)
     , m_timeout_sec(solver_timeout_sec)
+    , m_stagger_tolerance_pct(stagger_tolerance_pct)
 {}
 
 // ============================================================================
@@ -65,7 +66,8 @@ void MagmaTubeSolver::solve(
         const int64_t min_h_um = llround(m_min_h_mm * 1000.0);
         const int64_t max_h_um = llround(m_max_h_mm * 1000.0);
         greedy_warm_start(m_cells, m_edges, m_cell_edges, m_um,
-                          min_h_um, max_h_um, m_committed);
+                          min_h_um, max_h_um, m_committed,
+                          &m_cell_difficulty);
         validate_committed(m_edges, m_edge_index, m_committed, m_cells,
                            m_um, m_layer_data, m_min_h_mm, m_max_h_mm,
                            m_num_layers, "GREEDY");
@@ -84,8 +86,9 @@ void MagmaTubeSolver::solve(
             if (ld.height > 0 && ld.height < min_lh)
                 min_lh = ld.height;
         int max_h_layers = std::max(1, static_cast<int>(std::ceil(m_max_h_mm / min_lh)));
-        m_z_window = 4 * max_h_layers;
-        z_stride   = std::max(1, 2 * max_h_layers);
+        // Full-Z: window covers entire object height.
+        m_z_window = m_num_layers;
+        z_stride   = std::max(1, m_num_layers);
     }
 
     // Z extent of actual edge data (not all layers may have cells)
@@ -106,8 +109,6 @@ void MagmaTubeSolver::solve(
 
     // CP-SAT refinement (Refined mode only)
     if (m_mode == MagmaTubeSolverMode::Refined) {
-        // Solve Z levels bottom-up with overlapping windows. At each Z level,
-        // run 2 XY passes with R/2 offset — 50% overlap in XY, matching Z.
         int current_z = 0;
         if (progress_fn) progress_fn(0, num_z_levels);
         for (int z_off = 0; z_off <= max_edge_layer; z_off += z_stride) {
@@ -309,7 +310,7 @@ void MagmaTubeSolver::build_blocks(int off_a, int off_b, int off_z,
     }
 
     BOOST_LOG_TRIVIAL(debug) << "MagmaTubeSolver: pass offset(" << off_a << ","
-        << off_b << "," << off_z << ") -> " << out.size() << " blocks";
+        << off_b << ") -> " << out.size() << " blocks";
 }
 
 // ============================================================================
@@ -323,10 +324,29 @@ BlockResult MagmaTubeSolver::solve_block(const Block &block) const
     const int64_t min_h_um = llround(m_min_h_mm * 1000.0);
     const int64_t max_h_um = llround(m_max_h_mm * 1000.0);
 
-    // Phase-offset stagger grid: 3 grids offset by 0, P/3, 2P/3.
-    // Each edge type (Horizontal, Col60, Diag120) uses one grid.
-    // Triangle 3-coloring guarantees no two edges sharing a cell
-    // use the same grid → automatic stagger with zero constraints.
+    // ------------------------------------------------------------------
+    // Phase-offset stagger grid
+    // ------------------------------------------------------------------
+    // WHY 3 GRIDS: triangle 3-coloring guarantees adjacent edges (which share
+    // a cell) always use different phase grids. Since each edge's SharedEdge
+    // type (Horizontal/Col60/Diag120) maps deterministically to a phase,
+    // stagger is structural — it requires zero explicit pairwise constraints.
+    //
+    // WHY DOMAIN RESTRICTION (not objective penalties): the original design
+    // used W_GRID_DIST and W_DODGE soft objectives, but domain restriction is
+    // superior for two reasons:
+    //   1. Smaller domains → tighter LP relaxation → faster CP-SAT solving.
+    //      Boundaries go from ~10-30 positions (all layers) to ~3-8 (grid +
+    //      endpoints), and the O(n²) feasible-size computation shrinks too.
+    //   2. Dodge penalties spread injections across many Z levels (penalizing
+    //      nearby pairs pushes boundaries apart everywhere). Domain restriction
+    //      concentrates injections on a small set of grid-aligned Z levels,
+    //      which is preferable for practical injection logistics.
+    //
+    // FILL-RATE GUARANTEE: run endpoints are always included in the domain
+    // (see lines below), so the maximum-coverage solution is always feasible
+    // regardless of grid spacing. Grid points provide additional stagger
+    // options within runs, but never remove the ability to achieve full fill.
     const int64_t period_um = llround(m_stagger_period_mm * 1000.0);
     const int64_t z0_um = m_um.bottom_um.empty() ? 0 : m_um.bottom_um[0];
 
@@ -377,6 +397,8 @@ BlockResult MagmaTubeSolver::solve_block(const Block &block) const
         int64_t     run_start_um;  // which run this slot belongs to
         int64_t     run_end_um;
         operations_research::Domain contrib_dom; // {0} ∪ feasible sizes
+        std::vector<int64_t> boundaries;              // boundary values for this run
+        std::unordered_set<int64_t> on_grid;          // grid + run endpoint positions
     };
     std::vector<SegVars> all_segments;
 
@@ -409,8 +431,21 @@ BlockResult MagmaTubeSolver::solve_block(const Block &block) const
             if (eff_h < min_h_um)
                 continue; // Clipped range too short for a tube
 
-            int K = std::min(MAX_K, static_cast<int>(std::ceil(
-                        double(eff_h) / double(min_h_um))));
+            // K = enough slots to fill this run with average-sized tubes, plus
+            // 1 for stagger splitting. Also floor at the greedy tube count for
+            // this edge (so the solver can always represent the greedy solution).
+            // With full-Z, runs can span the entire object (a "run" is an
+            // uninterrupted cell-pair presence range, broken by model edges or
+            // mid-Z constrictions).
+            // K = greedy tube count in this run + 1 (room for one stagger split).
+            // Only count greedy tubes within this run's effective Z range.
+            int64_t run_start_um = m_um.bottom_um[eff_start];
+            int64_t run_end_um   = m_um.top_um[eff_end];
+            int K_from_greedy = 0;
+            for (const CommittedSegment &seg : m_committed[ei])
+                if (seg.start_um >= run_start_um && seg.end_um <= run_end_um)
+                    ++K_from_greedy;
+            int K = std::max(1, K_from_greedy * 2 + 1);
 
             // Unified layer boundary list for this run.
             // When stagger grid is active, filter to the edge's phase grid.
@@ -420,21 +455,93 @@ BlockResult MagmaTubeSolver::solve_block(const Block &block) const
             for (int L = eff_start; L <= eff_end; ++L)
                 all_boundaries.push_back(m_um.top_um[L]);
 
+            // Domain = {run endpoints} ∪ {grid-aligned layer boundaries}.
+            //
+            // Run endpoints are ALWAYS included — this is the fill-rate guarantee.
+            // Without them, a run whose endpoints don't fall on the grid would
+            // have no valid start/end position, losing coverage entirely.
+            //
+            // Grid points are additional options within runs. The solver picks
+            // them when they enable better cross-edge packing via NoOverlap
+            // (stagger "falls out" of the optimization). The resulting domain is
+            // typically 3-8 values instead of 10-30 (all_boundaries), which
+            // reduces the O(n²) feasible-size computation below and tightens
+            // CP-SAT's LP relaxation for faster solving.
+            // ----------------------------------------------------------
+            // Difficulty-based domain selection.
+            //
+            // For each run, compute the average difficulty of both cells
+            // across the run's layer range. Easy runs (low difficulty)
+            // get grid-restricted domains for stagger. Hard runs (high
+            // difficulty) get full domains to preserve coverage.
+            //
+            // Difficulty comes from greedy's initial unconstrained scoring:
+            //   0 = easiest (3 neighbors at max_h)
+            //   3 × max_h_um = hardest (no fillable neighbors)
+            //
+            // Threshold: 30% of max_possible = restrict when ≥70% of
+            // theoretical max flexibility is available.
+            // ----------------------------------------------------------
+            const int64_t max_possible = 3 * max_h_um;
+            const int64_t difficulty_threshold = max_possible * 3 / 10; // 30%
+
+            int64_t run_difficulty_sum = 0;
+            int run_difficulty_count = 0;
+            auto lookup_diff = [&](const TriangleCell &cell, int layer) -> int64_t {
+                auto it = m_cell_difficulty.find(cell);
+                if (it == m_cell_difficulty.end()) return max_possible;
+                auto pres_it = m_cells.find(cell);
+                if (pres_it == m_cells.end()) return max_possible;
+                int idx = layer - pres_it->second.first_layer;
+                if (idx < 0 || idx >= static_cast<int>(it->second.size())) return max_possible;
+                return it->second[idx];
+            };
+            for (int L = eff_start; L <= eff_end; ++L) {
+                run_difficulty_sum += lookup_diff(ed.edge.a, L) + lookup_diff(ed.edge.b, L);
+                run_difficulty_count += 2;
+            }
+            int64_t avg_difficulty = (run_difficulty_count > 0)
+                ? run_difficulty_sum / run_difficulty_count : max_possible;
+            if (period_um <= 0) {
+                BOOST_LOG_TRIVIAL(error) << "MagmaTubeSolver: stagger period must be > 0";
+                return BlockResult{};
+            }
+
+            bool restrict_domain = (avg_difficulty < difficulty_threshold);
+
             std::vector<int64_t> boundaries;
-            if (period_um > 0) {
+            std::unordered_set<int64_t> on_grid; // positions not penalized by W_OFFGRID
+            if (restrict_domain) {
+                // Easy run: grid + run endpoints + greedy hints.
+                // Stagger-friendly domain with off-grid penalty for greedy positions.
                 int phase = static_cast<int>(shared_edge(ed.edge.a, ed.edge.b));
                 const auto &snap = phase_snap[phase];
-                // Always include run endpoints (preserves edge-to-edge coverage)
-                // plus all grid-aligned positions (provides stagger within the run)
                 std::set<int64_t> bset;
-                bset.insert(all_boundaries.front()); // run start
-                bset.insert(all_boundaries.back());  // run end
+                bset.insert(all_boundaries.front());
+                bset.insert(all_boundaries.back());
+                on_grid.insert(all_boundaries.front());
+                on_grid.insert(all_boundaries.back());
                 for (int64_t b : all_boundaries)
-                    if (snap.count(b))
+                    if (snap.count(b)) {
                         bset.insert(b);
+                        on_grid.insert(b);
+                    }
+                // Greedy hint positions: valid domain but penalized (off-grid)
+                int64_t run_lo = all_boundaries.front();
+                int64_t run_hi = all_boundaries.back();
+                for (const CommittedSegment &seg : m_committed[ei]) {
+                    if (seg.start_um >= run_lo && seg.start_um <= run_hi)
+                        bset.insert(seg.start_um);
+                    if (seg.end_um >= run_lo && seg.end_um <= run_hi)
+                        bset.insert(seg.end_um);
+                }
                 boundaries.assign(bset.begin(), bset.end());
             } else {
+                // Hard run: full domain. All layer boundaries available,
+                // all treated as on-grid (no off-grid penalty).
                 boundaries = std::move(all_boundaries);
+                for (int64_t b : boundaries)
+                    on_grid.insert(b);
             }
             // boundaries is sorted: each value is the end of one layer
             // and the start of the next
@@ -492,7 +599,7 @@ BlockResult MagmaTubeSolver::solve_block(const Block &block) const
                 int64_t rs = boundaries.front();
                 int64_t re = boundaries.back();
                 all_segments.push_back({active, start, end, size, interval,
-                                        ei, rs, re, contrib_dom});
+                                        ei, rs, re, contrib_dom, boundaries, on_grid});
                 prev_active = active;
                 has_prev = true;
             }
@@ -502,8 +609,19 @@ BlockResult MagmaTubeSolver::solve_block(const Block &block) const
     // ------------------------------------------------------------------
     // 2. Add frozen intervals from committed tubes outside the block
     // ------------------------------------------------------------------
+    // Two kinds of frozen intervals prevent the solver from creating tubes
+    // that overlap with committed segments it can't modify:
+    //
+    // XY boundary frozen: edges that cross the XY block boundary have one
+    // cell inside and one outside. The committed tubes on these edges are
+    // controlled by whichever block contains both cells. We freeze them on
+    // the inside cell to prevent NoOverlap violations.
+    //
+    // KEY INVARIANT: a block only erases/replaces segments it can fully see
+    // (both cells in XY). With full-Z, all decision-edge segments are fully
+    // inside the Z range, so only XY boundary freezing is needed.
 
-    // Scan boundary edges via cell reverse lookup (avoids scanning all edges)
+    // (A) XY boundary: scan edges crossing the block boundary
     std::unordered_set<size_t> seen_boundary_edges;
     for (const TriangleCell &cell : block.cells) {
         auto it = m_cell_edges.find(cell);
@@ -534,9 +652,9 @@ BlockResult MagmaTubeSolver::solve_block(const Block &block) const
         }
     }
 
-    // Decision-edge segments that extend outside the block's Z range are frozen
-    // (the block can't fully see them). Segments fully inside Z range become
-    // warm start hints — the solver re-optimizes them.
+    // (B) Z boundary: decision-edge segments that extend outside the block's
+    // Z range are frozen. Segments fully inside Z range become warm start
+    // hints — the solver re-optimizes them.
     for (size_t ei : block.edge_indices) {
         for (const CommittedSegment &seg : m_committed[ei]) {
             if (seg.start_um >= block.z_start_um && seg.end_um <= block.z_end_um)
@@ -568,32 +686,82 @@ BlockResult MagmaTubeSolver::solve_block(const Block &block) const
     }
 
     // ------------------------------------------------------------------
-    // 4. Objective: two-tier lexicographic via weighted sum
+    // 4. Objective: coverage + excess tube budget + off-grid penalty
     //
-    //   Tier 1 — Coverage (fill): maximize total tube µm
-    //   Tier 2 — Tube count:      prefer fewer, longer tubes
+    //   Tier 1 — Coverage:  W_COVERAGE × Σ{contrib}       (dominant)
+    //   Tier 2 — Excess:    W_EXCESS × max(0, active - budget)
+    //   Tier 3 — Off-grid:  W_OFFGRID × Σ{is_offgrid}     (tiebreaker)
     //
-    // Stagger is handled by domain restriction (phase-offset grids),
-    // not by objective penalties. No Tier 3 needed.
+    // Stagger comes from domain restriction (phase-offset grids).
+    // The excess budget allows the solver to add tubes for stagger up
+    // to greedy_count × (1 + tolerance/100) without penalty. Beyond
+    // that, each extra tube costs W_EXCESS — preventing fragmentation
+    // while allowing stagger splits.
+    //
+    // Off-grid penalty nudges boundaries toward grid positions when
+    // coverage is equal. Greedy hint positions are in the domain so
+    // hints are valid, but the solver prefers grid positions.
     // ------------------------------------------------------------------
 
     constexpr int64_t W_COVERAGE = 1000000;
-
-    // Activation cost: 1 long tube is strictly cheaper than 2 short tubes
-    // with the same total coverage.
-    constexpr int64_t W_ACTIVATION = 100;
+    constexpr int64_t W_EXCESS  = 100;
+    constexpr int64_t W_OFFGRID = 1;
 
     LinearExpr objective;
 
-    for (auto &seg : all_segments) {
-        // Coverage: W_COVERAGE * size when active, 0 when not
+    for (const auto &seg : all_segments) {
         IntVar contrib = model.NewIntVar(seg.contrib_dom);
         model.AddEquality(contrib, seg.size).OnlyEnforceIf(seg.active);
         model.AddEquality(contrib, 0).OnlyEnforceIf(seg.active.Not());
         objective += W_COVERAGE * contrib;
+    }
 
-        // Activation cost: penalize each active segment to prefer fewer tubes
-        objective -= W_ACTIVATION * seg.active;
+    // Excess tube budget: free tubes up to greedy count × (1 + tolerance%).
+    // Only tubes beyond the budget are penalized.
+    {
+        int greedy_count = 0;
+        for (size_t ei : block.edge_indices)
+            greedy_count += static_cast<int>(m_committed[ei].size());
+
+        int budget = greedy_count * (100 + m_stagger_tolerance_pct) / 100;
+        if (budget > 0) {
+            LinearExpr total_active;
+            for (const auto &seg : all_segments)
+                total_active += seg.active;
+
+            IntVar excess = model.NewIntVar(
+                operations_research::Domain(0, static_cast<int>(all_segments.size())));
+            model.AddGreaterOrEqual(excess, total_active - budget);
+            objective -= W_EXCESS * excess;
+        }
+    }
+
+    // Off-grid penalty: nudge boundaries toward grid positions.
+    // Each boundary at a greedy (non-grid) position costs 1.
+    // Max total per block: ~160 (80 segs × 2 boundaries). Negligible vs coverage.
+    if (period_um > 0) {
+        for (const auto &seg : all_segments) {
+            auto make_offgrid = [&](IntVar boundary_var,
+                                    const std::vector<int64_t> &bounds,
+                                    const std::unordered_set<int64_t> &on_grid) -> IntVar {
+                bool has_offgrid = false;
+                for (int64_t b : bounds)
+                    if (!on_grid.count(b)) { has_offgrid = true; break; }
+                if (!has_offgrid)
+                    return model.NewConstant(0);
+
+                IntVar is_off = model.NewIntVar(operations_research::Domain(0, 1));
+                auto table = model.AddAllowedAssignments({boundary_var, is_off});
+                for (int64_t b : bounds)
+                    table.AddTuple({b, on_grid.count(b) ? 0 : 1});
+                return is_off;
+            };
+
+            IntVar start_off = make_offgrid(seg.start, seg.boundaries, seg.on_grid);
+            IntVar end_off   = make_offgrid(seg.end, seg.boundaries, seg.on_grid);
+            objective -= W_OFFGRID * start_off;
+            objective -= W_OFFGRID * end_off;
+        }
     }
 
     model.Maximize(objective);
@@ -601,47 +769,65 @@ BlockResult MagmaTubeSolver::solve_block(const Block &block) const
     // ------------------------------------------------------------------
     // 5. Complete solution hint (warm start)
     // ------------------------------------------------------------------
+    // Greedy segments become CP-SAT hints, letting the solver start from
+    // ~80% coverage instead of searching from scratch. This is critical for
+    // converging within the per-block timeout — without hints, blocks often
+    // time out at UNKNOWN with poor or no solutions.
+    //
+    // Hinting inactive slots (below) gives a COMPLETE initial solution. With
+    // all variables assigned, CP-SAT can immediately verify feasibility and
+    // begin improvement search, rather than spending time constructing an
+    // initial feasible solution that may be worse than greedy.
     {
         std::vector<bool> hinted(all_segments.size(), false);
+        int hint_matched = 0, hint_missed = 0, total_greedy = 0;
 
-        // Collect and sort committed segments per edge (within Z range)
-        std::unordered_map<size_t, std::vector<const CommittedSegment *>> edge_hints;
+        // For each edge in this block, try to match each greedy segment to
+        // a solver slot in the same run. Greedy segments are sorted by start.
         for (size_t ei : block.edge_indices) {
-            for (const CommittedSegment &seg : m_committed[ei]) {
+            // Collect greedy segments for this edge within block Z range
+            std::vector<const CommittedSegment *> greedy_segs;
+            for (const CommittedSegment &seg : m_committed[ei])
                 if (seg.start_um >= block.z_start_um && seg.end_um <= block.z_end_um)
-                    edge_hints[ei].push_back(&seg);
-            }
-        }
-        for (auto &[ei, hints] : edge_hints)
-            std::sort(hints.begin(), hints.end(),
+                    greedy_segs.push_back(&seg);
+            std::sort(greedy_segs.begin(), greedy_segs.end(),
                       [](const CommittedSegment *a, const CommittedSegment *b) {
                           return a->start_um < b->start_um;
                       });
+            total_greedy += static_cast<int>(greedy_segs.size());
 
-        // Match committed segments to the correct run's slot
-        for (auto &[ei, hints] : edge_hints) {
-            if (hints.empty()) continue;
-            size_t ci = 0;
-            for (size_t si = 0; si < all_segments.size(); ++si) {
-                if (ci >= hints.size()) break;
-                const auto &sv = all_segments[si];
-                if (sv.edge_idx != ei) continue;
-                const CommittedSegment *cs = hints[ci];
-                if (cs->start_um >= sv.run_start_um && cs->end_um <= sv.run_end_um) {
-                    model.AddHint(sv.active, true);
-                    model.AddHint(sv.start, cs->start_um);
-                    model.AddHint(sv.end, cs->end_um);
-                    hinted[si] = true;
-                    ++ci;
+            // Match each greedy segment to the first available slot in its run
+            for (const CommittedSegment *cs : greedy_segs) {
+                bool matched = false;
+                for (size_t si = 0; si < all_segments.size(); ++si) {
+                    if (hinted[si]) continue;
+                    const auto &sv = all_segments[si];
+                    if (sv.edge_idx != ei) continue;
+                    if (cs->start_um >= sv.run_start_um && cs->end_um <= sv.run_end_um) {
+                        model.AddHint(sv.active, true);
+                        model.AddHint(sv.start, cs->start_um);
+                        model.AddHint(sv.end, cs->end_um);
+                        hinted[si] = true;
+                        matched = true;
+                        ++hint_matched;
+                        break;
+                    }
                 }
+                if (!matched)
+                    ++hint_missed;
             }
         }
 
-        // Hint remaining segments as inactive (completes the initial solution)
-        for (size_t si = 0; si < all_segments.size(); ++si) {
+        // Hint remaining slots as inactive (complete initial solution)
+        for (size_t si = 0; si < all_segments.size(); ++si)
             if (!hinted[si])
                 model.AddHint(all_segments[si].active, false);
-        }
+
+        if (hint_missed > 0)
+            BOOST_LOG_TRIVIAL(warning) << "MagmaTubeSolver: " << hint_missed
+                << "/" << total_greedy << " greedy hints unmatched ("
+                << hint_matched << " matched, "
+                << (all_segments.size() - hint_matched) << " inactive)";
     }
 
     // ------------------------------------------------------------------
@@ -687,17 +873,32 @@ BlockResult MagmaTubeSolver::solve_block(const Block &block) const
                 result.segments.push_back({seg.edge_idx, {s, e}});
             }
         }
+        // Per-block coverage comparison
+        int64_t solver_cov = 0;
+        for (const auto &[eidx, seg] : result.segments)
+            solver_cov += seg.end_um - seg.start_um;
+        int64_t greedy_cov = 0;
+        for (size_t ei : block.edge_indices)
+            for (const CommittedSegment &cs : m_committed[ei])
+                greedy_cov += cs.end_um - cs.start_um;
+
         BOOST_LOG_TRIVIAL(debug) << "MagmaTubeSolver: block solved "
             << (response.status() == CpSolverStatus::OPTIMAL ? "OPTIMAL" : "FEASIBLE")
             << ", obj=" << response.objective_value()
-            << ", best_bound=" << response.best_objective_bound()
             << ", gap=" << (response.best_objective_bound() > 0
                 ? (1.0 - response.objective_value() / response.best_objective_bound()) * 100.0
                 : 0.0) << "%"
             << ", segs=" << result.segments.size()
             << "/" << all_segments.size()
             << ", wall=" << std::fixed << std::setprecision(2)
-            << response.wall_time() << "s";
+            << response.wall_time() << "s"
+            << " | cov=" << solver_cov/1000.0
+            << "mm greedy=" << greedy_cov/1000.0 << "mm";
+        if (solver_cov < greedy_cov)
+            BOOST_LOG_TRIVIAL(warning) << "  COVERAGE DROP: lost "
+                << (greedy_cov - solver_cov)/1000.0 << "mm"
+                << " (solver " << result.segments.size()
+                << " segs vs greedy on " << block.edge_indices.size() << " edges)";
     } else {
         // Count frozen intervals per cell for diagnostics
         int total_frozen = 0;
@@ -756,8 +957,8 @@ void MagmaTubeSolver::solve_pass(int off_a, int off_b, int off_z)
     for (const auto &br : results)
         total_segs += static_cast<int>(br.segments.size());
 
-    BOOST_LOG_TRIVIAL(debug) << "MagmaTubeSolver: pass(" << off_a << "," << off_b << ","
-        << off_z << "): " << blocks.size() << " blocks, "
+    BOOST_LOG_TRIVIAL(debug) << "MagmaTubeSolver: pass(" << off_a << "," << off_b
+        << "): " << blocks.size() << " blocks, "
         << total_segs << " segments, " << ms << "ms";
 }
 
@@ -777,8 +978,10 @@ void MagmaTubeSolver::commit_results(const std::vector<Block> &blocks,
     // preserved. This is the key invariant: a block only modifies what it can
     // fully see.
     for (size_t bi = 0; bi < blocks.size(); ++bi) {
-        if (!results[bi].solved)
+        if (!results[bi].solved) {
+            ++m_unknown_blocks;
             continue;
+        }
 
         const Block &block = blocks[bi];
         for (size_t ei : block.edge_indices) {
