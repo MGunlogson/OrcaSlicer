@@ -642,7 +642,8 @@ void PrintObject::prepare_infill()
         const PrintRegionConfig *tube_map_cfg = nullptr;
         for (size_t region_id = 0; region_id < this->num_printing_regions(); ++region_id) {
             const PrintRegion &region = this->printing_region(region_id);
-            if (is_magma_pattern(region.config().sparse_infill_pattern.value))
+            if (is_magma_pattern(region.config().sparse_infill_pattern.value)
+                || region.config().dual_infill_enabled.value)
             { tube_map_cfg = &region.config(); break; }
         }
 
