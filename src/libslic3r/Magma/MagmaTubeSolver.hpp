@@ -141,7 +141,7 @@ public:
         double min_tube_height_mm,
         double max_tube_height_mm,
         int    num_layers,
-        double dodge_distance_mm = 0.0,
+        double stagger_period_mm = 0.0,
         MagmaTubeSolverMode mode = MagmaTubeSolverMode::Refined,
         double solver_timeout_sec = 20.0);
 
@@ -180,7 +180,7 @@ private:
     double m_max_h_mm;
     int    m_num_layers;
     int    m_z_window; // Z block size in layers
-    double m_dodge_mm; // boundary dodge distance (0 = stagger disabled)
+    double m_stagger_period_mm; // stagger grid period (0 = disabled)
     MagmaTubeSolverMode m_mode;
     double m_timeout_sec;
 
@@ -197,7 +197,7 @@ private:
     // Cancellation: checked between passes. Mid-solve abort not yet wired.
 
     // Constants
-    static constexpr int    R              = 6;
+    static constexpr int    R              = 4;
     static constexpr int    CPSAT_WORKERS  = 8;
     static constexpr int    MAX_K          = 4;
 };

@@ -202,7 +202,7 @@ private:
     float  m_line_width;
     float  m_layer_height;            // nominal config layer height (fallback)
     float  m_min_layer_height;        // smallest layer height in the object
-    double m_dodge_distance;          // boundary dodge distance in mm (stagger target)
+    double m_stagger_period;          // stagger grid period in mm (0 = disabled)
     double m_max_tube_height_mm;      // max tube height in mm (drives boundary placement)
     double m_min_tube_height_mm;      // min tube height in mm
     int    m_num_layers;

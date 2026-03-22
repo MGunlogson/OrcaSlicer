@@ -1257,7 +1257,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloat,                magma_interior_width))         // Cell hole size (mm), 0 = auto
     ((ConfigOptionFloat,                magma_window_height_mm))       // Window gap height (mm), 0 = auto
     ((ConfigOptionFloat,                magma_tube_height))            // Tube height in mm
-    ((ConfigOptionFloat,                magma_boundary_dodge))         // Boundary dodge distance in mm (0 = auto: 4x max_layer_height)
+    ((ConfigOptionFloat,                magma_stagger_period))         // Stagger grid period in mm (0 = auto: max_tube_height/3)
     ((ConfigOptionBool,                 magma_spiral_interlock))       // Enable spiral interlock between layers
     ((ConfigOptionBool,                 magma_overlap_line_correction)) // Reduce line width for vertex overlap
     ((ConfigOptionPercent,              magma_overlap_min_width))       // Min line width as % of nozzle (0 = auto 90%)

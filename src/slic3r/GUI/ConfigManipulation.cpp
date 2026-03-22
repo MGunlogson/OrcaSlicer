@@ -948,8 +948,8 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, co
     auto* solver_mode_opt = config->option<ConfigOptionEnum<MagmaTubeSolverMode>>("magma_tube_solver_mode");
     bool is_refined = have_magma_pattern && solver_mode_opt &&
         solver_mode_opt->value == MagmaTubeSolverMode::Refined;
-    // Refined-only settings: dodge distance and solver timeout
-    toggle_line("magma_boundary_dodge", is_refined);
+    toggle_line("magma_stagger_period", have_magma_pattern);
+    // Refined-only setting: solver timeout
     toggle_line("magma_solver_timeout", is_refined);
 
     // Magma Injection section

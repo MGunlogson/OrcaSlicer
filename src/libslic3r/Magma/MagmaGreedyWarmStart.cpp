@@ -279,6 +279,17 @@ void greedy_warm_start(
 
         if (tube_end - tube_start < min_h_um) continue;
 
+        int64_t tube_h = tube_end - tube_start;
+        BOOST_LOG_TRIVIAL(debug) << "MagmaGreedy: assign #" << total_assigned
+            << " cell(" << entry.cell.a << "," << entry.cell.b << "," << (entry.cell.is_up()?"U":"D") << ")"
+            << " + nbr(" << best_neighbor.a << "," << best_neighbor.b << "," << (best_neighbor.is_up()?"U":"D") << ")"
+            << " edge=" << best_edge_idx
+            << " h=" << tube_h/1000.0 << "mm"
+            << " [" << tube_start/1000.0 << "-" << tube_end/1000.0 << "]"
+            << " run=[" << best_run->start_layer << "-" << best_run->end_layer << "]"
+            << " score=" << entry.score
+            << " nbr_free=" << best_neighbor_free;
+
         committed[best_edge_idx].push_back({tube_start, tube_end});
         consumed[entry.cell].add(tube_start, tube_end);
         consumed[best_neighbor].add(tube_start, tube_end);
@@ -286,10 +297,29 @@ void greedy_warm_start(
         ++since_rescore;
     }
 
+    // Summary: height distribution of assigned tubes
+    int64_t min_assigned_h = INT64_MAX, max_assigned_h = 0, sum_h = 0;
+    int total_segs = 0;
+    for (const auto &segs : committed) {
+        for (const auto &seg : segs) {
+            int64_t h = seg.end_um - seg.start_um;
+            min_assigned_h = std::min(min_assigned_h, h);
+            max_assigned_h = std::max(max_assigned_h, h);
+            sum_h += h;
+            ++total_segs;
+        }
+    }
+
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::high_resolution_clock::now() - t_start).count();
     BOOST_LOG_TRIVIAL(info) << "MagmaGreedy: " << total_assigned << " tubes assigned, "
         << total_skipped << " skipped, " << rescores << " rescores, " << ms << "ms";
+    if (total_segs > 0)
+        BOOST_LOG_TRIVIAL(info) << "MagmaGreedy heights: min=" << min_assigned_h/1000.0
+            << "mm max=" << max_assigned_h/1000.0
+            << "mm avg=" << (sum_h/total_segs)/1000.0
+            << "mm (min_h=" << min_h_um/1000.0
+            << " max_h=" << max_h_um/1000.0 << ")";
 }
 
 } // namespace magma

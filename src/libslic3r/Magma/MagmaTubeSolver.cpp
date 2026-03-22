@@ -29,7 +29,7 @@ MagmaTubeSolver::MagmaTubeSolver(
     double min_tube_height_mm,
     double max_tube_height_mm,
     int    num_layers,
-    double dodge_distance_mm,
+    double stagger_period_mm,
     MagmaTubeSolverMode mode,
     double solver_timeout_sec)
     : m_cells(cells)
@@ -38,7 +38,7 @@ MagmaTubeSolver::MagmaTubeSolver(
     , m_max_h_mm(max_tube_height_mm)
     , m_num_layers(num_layers)
     , m_z_window(0)
-    , m_dodge_mm(dodge_distance_mm)
+    , m_stagger_period_mm(stagger_period_mm)
     , m_mode(mode)
     , m_timeout_sec(solver_timeout_sec)
 {}
@@ -322,8 +322,44 @@ BlockResult MagmaTubeSolver::solve_block(const Block &block) const
 
     const int64_t min_h_um = llround(m_min_h_mm * 1000.0);
     const int64_t max_h_um = llround(m_max_h_mm * 1000.0);
-    // Dodge zone from config (0 = stagger disabled)
-    const int64_t dodge_um = llround(m_dodge_mm * 1000.0);
+
+    // Phase-offset stagger grid: 3 grids offset by 0, P/3, 2P/3.
+    // Each edge type (Horizontal, Col60, Diag120) uses one grid.
+    // Triangle 3-coloring guarantees no two edges sharing a cell
+    // use the same grid → automatic stagger with zero constraints.
+    const int64_t period_um = llround(m_stagger_period_mm * 1000.0);
+    const int64_t z0_um = m_um.bottom_um.empty() ? 0 : m_um.bottom_um[0];
+
+    // Pre-compute the 3 phase grid snap sets (sorted allowed boundary positions)
+    std::array<std::unordered_set<int64_t>, 3> phase_snap;
+    if (period_um > 0) {
+        // Collect all layer boundaries
+        std::set<int64_t> all_bounds;
+        for (int L = 0; L < m_num_layers; ++L) {
+            all_bounds.insert(m_um.bottom_um[L]);
+            all_bounds.insert(m_um.top_um[L]);
+        }
+        int64_t z_max = m_um.top_um[m_num_layers - 1];
+        int64_t phase_offset = period_um / 3;
+
+        for (int phase = 0; phase < 3; ++phase) {
+            int64_t offset = phase * phase_offset;
+            for (int64_t g = z0_um + offset; g <= z_max + period_um; g += period_um) {
+                // Snap to nearest actual layer boundary
+                auto it = all_bounds.lower_bound(g);
+                int64_t best = -1, best_dist = INT64_MAX;
+                if (it != all_bounds.end() && (*it - g) < best_dist)
+                    { best_dist = *it - g; best = *it; }
+                if (it != all_bounds.begin())
+                    { --it; if ((g - *it) < best_dist) best = *it; }
+                if (best >= 0) phase_snap[phase].insert(best);
+            }
+        }
+
+        BOOST_LOG_TRIVIAL(debug) << "MagmaTubeSolver: phase grids: "
+            << phase_snap[0].size() << "/" << phase_snap[1].size() << "/"
+            << phase_snap[2].size() << " positions (period=" << period_um/1000.0 << "mm)";
+    }
 
     CpModelBuilder model;
 
@@ -376,11 +412,30 @@ BlockResult MagmaTubeSolver::solve_block(const Block &block) const
             int K = std::min(MAX_K, static_cast<int>(std::ceil(
                         double(eff_h) / double(min_h_um))));
 
-            // Unified layer boundary list for this run
-            std::vector<int64_t> boundaries;
-            boundaries.push_back(m_um.bottom_um[eff_start]);
+            // Unified layer boundary list for this run.
+            // When stagger grid is active, filter to the edge's phase grid.
+            // Phase is determined by SharedEdge type (3-coloring).
+            std::vector<int64_t> all_boundaries;
+            all_boundaries.push_back(m_um.bottom_um[eff_start]);
             for (int L = eff_start; L <= eff_end; ++L)
-                boundaries.push_back(m_um.top_um[L]);
+                all_boundaries.push_back(m_um.top_um[L]);
+
+            std::vector<int64_t> boundaries;
+            if (period_um > 0) {
+                int phase = static_cast<int>(shared_edge(ed.edge.a, ed.edge.b));
+                const auto &snap = phase_snap[phase];
+                // Always include run endpoints (preserves edge-to-edge coverage)
+                // plus all grid-aligned positions (provides stagger within the run)
+                std::set<int64_t> bset;
+                bset.insert(all_boundaries.front()); // run start
+                bset.insert(all_boundaries.back());  // run end
+                for (int64_t b : all_boundaries)
+                    if (snap.count(b))
+                        bset.insert(b);
+                boundaries.assign(bset.begin(), bset.end());
+            } else {
+                boundaries = std::move(all_boundaries);
+            }
             // boundaries is sorted: each value is the end of one layer
             // and the start of the next
 
@@ -448,9 +503,6 @@ BlockResult MagmaTubeSolver::solve_block(const Block &block) const
     // 2. Add frozen intervals from committed tubes outside the block
     // ------------------------------------------------------------------
 
-    // Frozen boundaries for stagger penalty
-    std::unordered_map<TriangleCell, std::vector<int64_t>, TriangleCellHash> frozen_boundaries;
-
     // Scan boundary edges via cell reverse lookup (avoids scanning all edges)
     std::unordered_set<size_t> seen_boundary_edges;
     for (const TriangleCell &cell : block.cells) {
@@ -478,10 +530,6 @@ BlockResult MagmaTubeSolver::solve_block(const Block &block) const
                 IntervalVar frozen = model.NewFixedSizeIntervalVar(
                     clip_start, clip_end - clip_start);
                 cell_intervals[inside_cell].push_back(frozen);
-
-                // Record boundaries for stagger (use actual, not clipped)
-                frozen_boundaries[inside_cell].push_back(seg.start_um);
-                frozen_boundaries[inside_cell].push_back(seg.end_um);
             }
         }
     }
@@ -504,11 +552,6 @@ BlockResult MagmaTubeSolver::solve_block(const Block &block) const
             const EdgeData &ed = m_edges[ei];
             cell_intervals[ed.edge.a].push_back(frozen);
             cell_intervals[ed.edge.b].push_back(frozen);
-
-            frozen_boundaries[ed.edge.a].push_back(seg.start_um);
-            frozen_boundaries[ed.edge.a].push_back(seg.end_um);
-            frozen_boundaries[ed.edge.b].push_back(seg.start_um);
-            frozen_boundaries[ed.edge.b].push_back(seg.end_um);
         }
     }
 
@@ -525,36 +568,24 @@ BlockResult MagmaTubeSolver::solve_block(const Block &block) const
     }
 
     // ------------------------------------------------------------------
-    // 4. Objective: three-tier lexicographic via weighted sum
+    // 4. Objective: two-tier lexicographic via weighted sum
     //
     //   Tier 1 — Coverage (fill): maximize total tube µm
-    //   Tier 2 — Tube length:     prefer fewer, longer tubes
-    //   Tier 3 — Stagger:         spread tube boundaries apart
+    //   Tier 2 — Tube count:      prefer fewer, longer tubes
     //
-    // Each tier's minimum contribution exceeds the next tier's maximum
-    // total, so higher tiers always dominate.  This prevents the solver
-    // from splitting a long tube into short ones for stagger benefit.
-    //
-    // Overflow budget:  max objective ≈ 5×10¹³, int64_max ≈ 9.2×10¹⁸
-    //                   (184,000× headroom)
+    // Stagger is handled by domain restriction (phase-offset grids),
+    // not by objective penalties. No Tier 3 needed.
     // ------------------------------------------------------------------
 
-    // Tier 1: coverage — 1µm of fill outweighs all activation + stagger.
     constexpr int64_t W_COVERAGE = 1000000;
 
-    // Tier 2: activation cost — fixed penalty per active tube segment.
-    // A linear length bonus (W*size) can't prevent splitting because
-    // W*S == W*(S/2) + W*(S/2).  The activation cost makes 1 long tube
-    // strictly cheaper than 2 short tubes with the same total coverage.
-    // Must exceed max stagger benefit of one split (~36).
+    // Activation cost: 1 long tube is strictly cheaper than 2 short tubes
+    // with the same total coverage.
     constexpr int64_t W_ACTIVATION = 100;
-
-    // Tier 3: stagger — tiebreaker among equal-coverage, equal-count solutions.
-    // (W_STAGGER_TIGHT and W_STAGGER_WIDE defined below, values 2 and 1)
 
     LinearExpr objective;
 
-    for (const auto &seg : all_segments) {
+    for (auto &seg : all_segments) {
         // Coverage: W_COVERAGE * size when active, 0 when not
         IntVar contrib = model.NewIntVar(seg.contrib_dom);
         model.AddEquality(contrib, seg.size).OnlyEnforceIf(seg.active);
@@ -564,147 +595,6 @@ BlockResult MagmaTubeSolver::solve_block(const Block &block) const
         // Activation cost: penalize each active segment to prefer fewer tubes
         objective -= W_ACTIVATION * seg.active;
     }
-
-    // Stagger: per-cell cumulative penalty (skipped when dodge_um == 0).
-    //
-    // For each cell C, create two cumulative constraints (tight + wide scale)
-    // covering boundaries from C's Ring-0 edges (demand=2) and Ring-1
-    // neighbor edges (demand=1). Each boundary creates an exclusion zone
-    // interval centered on its position. The cumulative capacity variable
-    // measures peak boundary concentration — the solver minimizes it.
-    //
-    // Two scales provide graduated penalty: very close boundaries trigger
-    // both tight and wide penalties, moderately close only trigger wide.
-
-    constexpr int64_t W_STAGGER_TIGHT = 2;
-    constexpr int64_t W_STAGGER_WIDE  = 1;
-
-    if (dodge_um > 0) {
-
-    const int64_t wide_zone_um  = dodge_um;
-    const int64_t tight_zone_um = std::max<int64_t>(1, dodge_um / 2);
-
-    std::unordered_set<size_t> block_edge_set(block.edge_indices.begin(),
-                                               block.edge_indices.end());
-
-    // Build edge → segment indices index
-    std::unordered_map<size_t, std::vector<size_t>> edge_to_segs;
-    for (size_t si = 0; si < all_segments.size(); ++si)
-        edge_to_segs[all_segments[si].edge_idx].push_back(si);
-
-    // Pre-create zone intervals for each segment boundary (reused across
-    // multiple cells' cumulatives — same IntervalVar, different demands)
-    struct BoundaryZones {
-        IntervalVar tight_start, tight_end;
-        IntervalVar wide_start, wide_end;
-    };
-    std::vector<BoundaryZones> seg_zones(all_segments.size());
-    for (size_t si = 0; si < all_segments.size(); ++si) {
-        const auto &seg = all_segments[si];
-        seg_zones[si].tight_start = model.NewOptionalFixedSizeIntervalVar(
-            seg.start - tight_zone_um / 2, tight_zone_um, seg.active);
-        seg_zones[si].tight_end = model.NewOptionalFixedSizeIntervalVar(
-            seg.end - tight_zone_um / 2, tight_zone_um, seg.active);
-        seg_zones[si].wide_start = model.NewOptionalFixedSizeIntervalVar(
-            seg.start - wide_zone_um / 2, wide_zone_um, seg.active);
-        seg_zones[si].wide_end = model.NewOptionalFixedSizeIntervalVar(
-            seg.end - wide_zone_um / 2, wide_zone_um, seg.active);
-    }
-
-    // Pre-create zone intervals for frozen boundaries (keyed by position
-    // to avoid duplicates, since the same frozen boundary may appear in
-    // multiple cells' maps)
-    struct FrozenZones {
-        IntervalVar tight, wide;
-    };
-    std::unordered_map<int64_t, FrozenZones> frozen_zone_cache;
-    auto get_frozen_zones = [&](int64_t pos) -> const FrozenZones & {
-        auto it = frozen_zone_cache.find(pos);
-        if (it != frozen_zone_cache.end())
-            return it->second;
-        FrozenZones fz;
-        fz.tight = model.NewFixedSizeIntervalVar(
-            pos - tight_zone_um / 2, tight_zone_um);
-        fz.wide = model.NewFixedSizeIntervalVar(
-            pos - wide_zone_um / 2, wide_zone_um);
-        return frozen_zone_cache.emplace(pos, fz).first->second;
-    };
-
-    // For each cell, build cumulative constraints over its Ring-1 neighborhood
-    for (const TriangleCell &cell : block.cells) {
-        // Collect segment indices with demand weight:
-        //   Ring-0 (cell's own edges): demand = 2
-        //   Ring-1 (neighbor edges):   demand = 1
-        struct SegDemand { size_t seg_idx; int demand; };
-        std::vector<SegDemand> seg_demands;
-        std::unordered_set<size_t> seen_edges;
-
-        auto add_edges_for_cell = [&](const TriangleCell &c, int demand) {
-            auto it = m_cell_edges.find(c);
-            if (it == m_cell_edges.end()) return;
-            for (size_t ei : it->second) {
-                if (!block_edge_set.count(ei)) continue;
-                if (!seen_edges.insert(ei).second) continue;
-                auto seg_it = edge_to_segs.find(ei);
-                if (seg_it == edge_to_segs.end()) continue;
-                for (size_t si : seg_it->second)
-                    seg_demands.push_back({si, demand});
-            }
-        };
-
-        // Ring-0: edges involving this cell
-        add_edges_for_cell(cell, 2);
-        // Ring-1: edges involving neighbor cells
-        for (const TriangleCell &nbr : cell.neighbors())
-            add_edges_for_cell(nbr, 1);
-
-        // Collect frozen boundaries: Ring-0 (demand=2) + Ring-1 (demand=1)
-        struct FrozenDemand { int64_t pos; int demand; };
-        std::vector<FrozenDemand> frozen_demands;
-        std::unordered_set<int64_t> seen_frozen;
-
-        auto add_frozen_for_cell = [&](const TriangleCell &c, int demand) {
-            auto it = frozen_boundaries.find(c);
-            if (it == frozen_boundaries.end()) return;
-            for (int64_t fb : it->second)
-                if (seen_frozen.insert(fb).second)
-                    frozen_demands.push_back({fb, demand});
-        };
-
-        add_frozen_for_cell(cell, 2);
-        // Ring-1: frozen boundaries from neighbor cells
-        for (const TriangleCell &nbr : cell.neighbors())
-            add_frozen_for_cell(nbr, 1);
-
-        // Skip cells with too few boundaries to have meaningful stagger
-        if (seg_demands.size() + frozen_demands.size() < 2)
-            continue;
-
-        // Build cumulative at each scale
-        auto build_cumulative = [&](bool tight, int64_t weight) {
-            // Capacity is purely soft — any value is feasible, higher = more
-            // penalty in the objective. Domain must never cause INFEASIBLE.
-            IntVar capacity = model.NewIntVar(
-                operations_research::Domain(0, 10000));
-            auto cum = model.AddCumulative(capacity);
-
-            for (const auto &sd : seg_demands) {
-                const auto &z = seg_zones[sd.seg_idx];
-                cum.AddDemand(tight ? z.tight_start : z.wide_start, sd.demand);
-                cum.AddDemand(tight ? z.tight_end   : z.wide_end,   sd.demand);
-            }
-            for (const auto &fd : frozen_demands) {
-                const auto &fz = get_frozen_zones(fd.pos);
-                cum.AddDemand(tight ? fz.tight : fz.wide, fd.demand);
-            }
-
-            objective -= weight * capacity;
-        };
-
-        build_cumulative(true,  W_STAGGER_TIGHT);
-        build_cumulative(false, W_STAGGER_WIDE);
-    }
-    } // if (dodge_um > 0)
 
     model.Maximize(objective);
 
@@ -1119,7 +1009,9 @@ ValidationResult validate_committed(
             << overall_pct << "% overall, "
             << cells_zero << " cells unfilled, "
             << cells_below_25 << " cells <25%, "
-            << cells_below_50 << " cells <50%";
+            << cells_below_50 << " cells <50%"
+            << " (covered=" << int64_t(total_covered_um) << "um"
+            << " presence=" << int64_t(total_presence_um) << "um)";
     }
 
     return result;
