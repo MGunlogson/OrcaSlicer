@@ -1,8 +1,14 @@
 #include <cassert>
 
+#include <algorithm>
+
 #include "libslic3r/Flow.hpp"
 #include "libslic3r/Slicing.hpp"
 #include "libslic3r/libslic3r.h"
+#include "libslic3r/Magma/MagmaTriangleCell.hpp"
+#include "libslic3r/Magma/MagmaTubeMap.hpp"
+#include "libslic3r/Magma/MagmaPatterns.hpp"
+#include "libslic3r/Magma/MagmaResolved.hpp"
 
 #include "PresetHints.hpp"
 
@@ -128,9 +134,12 @@ std::string PresetHints::maximum_volumetric_flow_description(const PresetBundle 
     auto feature_extruder_active = [idx_extruder, num_extruders](int i) {
         return i <= 0 || i > num_extruders || idx_extruder == -1 || idx_extruder == i - 1;
     };
-    bool perimeter_extruder_active                  = feature_extruder_active(print_config.opt_int("wall_filament"));
-    bool infill_extruder_active                     = feature_extruder_active(print_config.opt_int("sparse_infill_filament"));
-    bool solid_infill_extruder_active               = feature_extruder_active(print_config.opt_int("solid_infill_filament"));
+    bool perimeter_extruder_active                  = feature_extruder_active(print_config.opt_int("outer_wall_filament_id"))
+                                                    && feature_extruder_active(print_config.opt_int("inner_wall_filament_id"));
+    bool infill_extruder_active                     = feature_extruder_active(print_config.opt_int("sparse_infill_filament_id"));
+    bool solid_infill_extruder_active               = feature_extruder_active(print_config.opt_int("internal_solid_filament_id"))
+                                                    && feature_extruder_active(print_config.opt_int("top_surface_filament_id"))
+                                                    && feature_extruder_active(print_config.opt_int("bottom_surface_filament_id"));
     bool support_material_extruder_active           = feature_extruder_active(print_config.opt_int("support_filament"));
     bool support_material_interface_extruder_active = feature_extruder_active(print_config.opt_int("support_interface_filament"));
 
@@ -307,10 +316,150 @@ std::string PresetHints::top_bottom_shell_thickness_explanation(const PresetBund
         	out += " ";
 	        out += (boost::format(_utf8(L("Minimum bottom shell thickness is %1% mm."))) % bottom_shell_thickness_minimum).str();        	
         }
-    } else 
+    } else
         out += _utf8(L("Bottom is open."));
     */
     return out;
+}
+
+// Magma live readouts: derived tube and injection numbers that no settings field shows.
+// Everything resolves through the same magma:: helpers the slicer uses; do not reimplement a formula here.
+
+// Adapts the edited presets to the typed configs magma::resolve_magma() takes.
+static bool magma_resolve(const PresetBundle &preset_bundle, magma::MagmaResolved &out)
+{
+    const DynamicPrintConfig &print_config   = preset_bundle.prints  .get_edited_preset().config;
+    const DynamicPrintConfig &printer_config = preset_bundle.printers.get_edited_preset().config;
+
+    PrintRegionConfig region;  region.apply(print_config,   true);
+    PrintObjectConfig object;  object.apply(print_config,   true);
+    PrintConfig       printer; printer.apply(printer_config, true);
+    if (printer.nozzle_diameter.values.empty())
+        return false;
+
+    return magma::resolve_magma(region, object, printer, out);
+}
+
+// Each row goes terse into `text` ("Label:  value") and with its explanation into `tooltip`.
+namespace {
+struct MagmaRows {
+    std::string text;      // "Label:  value"
+    std::string tooltip;   // "Label:  value — why"
+    void add(const std::string &label, const std::string &value, const std::string &why = {})
+    {
+        text += label + ":  " + value + "\n";
+        tooltip += label + ":  " + value;
+        if (! why.empty())
+            tooltip += " \u2014 " + why;
+        tooltip += "\n";
+    }
+    PresetHints::MagmaReadout finish() const
+    {
+        auto trim = [](std::string v) {
+            while (! v.empty() && v.back() == '\n') v.pop_back();
+            return v;
+        };
+        return { trim(text), trim(tooltip) };
+    }
+};
+} // namespace
+
+PresetHints::MagmaReadout PresetHints::magma_geometry_readout(const PresetBundle &preset_bundle)
+{
+    magma::MagmaResolved m;
+    if (! magma_resolve(preset_bundle, m))
+        return {};
+
+    const double open_area = m.geometry->inset_open_area(m.cell_spacing, m.line_width);
+    const double open_pct  = m.cell_spacing > 0.0
+                                 ? 100.0 * open_area / (m.cell_spacing * m.cell_spacing) : 0.0;
+    auto mm = [](double v) { return (boost::format("%1$.3f mm") % v).str(); };
+
+    MagmaRows r;
+    // An unmeasured flat is estimated from the bore and every row below derives from it, so flag that first.
+    if (m.injection_flat_is_estimate)
+        r.add(_utf8(L("Nozzle tip flat")),
+              (boost::format(_utf8(L("%1$.2f mm  (ESTIMATED)"))) % m.injection_nozzle_flat).str(),
+              _utf8(L("not measured, so this is a guess from the bore and every figure below is "
+                      "derived from it; slicing will refuse until you measure the flat")));
+    r.add(_utf8(L("Tube interior")), mm(m.interior_width),
+          (boost::format(_utf8(L("open width of one cell; cell spacing %1$.3f mm at %2$.2f mm line width")))
+           % m.cell_spacing % m.line_width).str());
+    r.add(_utf8(L("Usable bore")), mm(m.bore_diameter),
+          m.injection_nozzle_flat > 0.0
+              ? (boost::format(_utf8(L("largest circle that fits inside the tube, %1$.0f%% of the %2$.2f mm nozzle flat")))
+                 % (100.0 * m.bore_diameter / m.injection_nozzle_flat) % m.injection_nozzle_flat).str()
+              : _utf8(L("largest circle that fits inside the tube")));
+    r.add(_utf8(L("Seal opening")), mm(m.opening_diameter),
+          _utf8(L("circle the nozzle must cover to seal; wider than the bore because the corners have to be covered too")));
+    r.add(_utf8(L("Open cross-section")),
+          (boost::format("%1$.3f mm\u00b2") % open_area).str(),
+          open_pct > 0.0
+              ? (boost::format(_utf8(L("%1$.0f%% of the lattice footprint is open tube"))) % open_pct).str()
+              : std::string());
+    return r.finish();
+}
+
+PresetHints::MagmaReadout PresetHints::magma_injection_readout(const PresetBundle &preset_bundle)
+{
+    magma::MagmaResolved m;
+    if (! magma_resolve(preset_bundle, m))
+        return {};
+
+    const DynamicPrintConfig &print_config = preset_bundle.prints.get_edited_preset().config;
+    auto mm = [](double v) { return (boost::format("%1$.3f mm") % v).str(); };
+
+    MagmaRows r;
+    // A value cut down by the depth budget shows the effective value with the requested one beside it.
+    auto mm_clamped = [&mm](double effective, double requested) {
+        return mm(effective) + (boost::format(_utf8(L("  (asked %1$.3f, capped)"))) % requested).str();
+    };
+
+    r.add(_utf8(L("Seal depth")), mm(m.seal_depth),
+          m.opening_diameter > m.injection_nozzle_flat
+              ? _utf8(L("reached in one fast move before any filament flows: the opening is wider than the nozzle flat, so the nozzle descends until the cone covers it"))
+              : _utf8(L("the flat already covers the opening, so the nozzle seats on the rim without entering the tube")));
+    r.add(_utf8(L("Corner grip")), mm(m.grip),
+          _utf8(L("what actually holds the seal shut: (press + plunge) x tan(cone angle). Both are depth past first contact -- one before the injection, one during it. The corner is the last part of the opening the cone covers, so it is the least pressed contact in the cell and the first to let go")));
+    r.add(_utf8(L("Plunge")),
+          m.plunge_clamped() ? mm_clamped(m.plunge_depth, m.plunge_requested) : mm(m.plunge_depth),
+          ! print_config.opt_bool("magma_injection_plunge")
+              ? _utf8(L("disabled"))
+              : (m.plunge_clamped()
+                     ? _utf8(L("the seal depth already spent most of the budget, leaving only this much room to sink further"))
+                     : _utf8(L("the nozzle sinks this much further WHILE the tube fills, paced to the extrusion, keeping the seal shut as pressure builds"))));
+    r.add(_utf8(L("Total immersion")), mm(m.total_depth()),
+          _utf8(L("seal depth plus plunge -- the deepest the nozzle gets, reached as the last filament goes in and held through the dwell. A consequence of the two settings above, not a budget they are spent from")));
+    r.add(_utf8(L("Nozzle vs cell pitch")),
+          (boost::format("%1$.0f%%") % (100.0 * m.pitch_ratio())).str(),
+          m.pitch_ratio() > magma::MAGMA_PITCH_ABSURD_RATIO
+              ? _utf8(L("the cone covers an entire neighbouring cell before it touches the one it is sealing"))
+              : _utf8(L("how much of the cell pitch the cone spans at seal depth. A geometry figure, not a quality one -- prints have been clean well past 100%; what actually damages the lattice is how LONG each injection takes")));
+
+    const double open_area   = m.geometry->inset_open_area(m.cell_spacing, m.line_width);
+    const double tube_height = print_config.opt_float("magma_tube_height");
+    const double fill_factor = print_config.opt_float("magma_tube_fill_factor");
+    if (open_area > 0.0 && tube_height > 0.0)
+        // A U-tube is two cells sharing a window, filled by one injection. Ignores the window cavity
+        // and part-edge clipping; the slicer measures the real cavity from the toolpath.
+        r.add(_utf8(L("Injected per U-tube")),
+              (boost::format("%1$.2f mm\u00b3") % (2.0 * open_area * tube_height * fill_factor)).str(),
+              (boost::format(_utf8(L("estimate: 2 cells x %1$.3f mm\u00b2 x %2$.1f mm x %3$.2f fill factor. The slicer measures each tube's real cavity from the printed toolpath")))
+               % open_area % tube_height % fill_factor).str());
+
+    // Last row: the binding constraint. filament_max_volumetric_speed is in the filament preset.
+    const double max_vol =
+        preset_bundle.filaments.get_edited_preset().config.opt_float("filament_max_volumetric_speed", 0);
+    const double secs    = magma::injection_seconds(open_area, tube_height, fill_factor, max_vol);
+    if (secs > 0.0)
+        r.add(_utf8(L("Injection time")),
+              (boost::format("%1$.2f s") % secs).str(),
+              secs > magma::MAGMA_MAX_INJECTION_SECONDS
+                  ? (boost::format(_utf8(L("past the ~%1$.1f s the lattice survives -- the nozzle softens the surrounding walls and the cells deform. Reduce tube height, then width")))
+                     % magma::MAGMA_MAX_INJECTION_SECONDS).str()
+                  : (boost::format(_utf8(L("how long the nozzle stays sealed in each cell, at the filament's %1$.1f mm\u00b3/s. THE number that decides whether a print is clean: keep it under ~%2$.1f s")))
+                     % max_vol % magma::MAGMA_MAX_INJECTION_SECONDS).str());
+    return r.finish();
 }
 
 }; // namespace Slic3r

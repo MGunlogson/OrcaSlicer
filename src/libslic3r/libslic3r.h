@@ -274,6 +274,27 @@ ForwardIt binary_find_by_predicate(ForwardIt first, ForwardIt last, LowerThanKey
     return first != last && equal_to_key(*first) ? first : last;
 }
 
+// Element of a range sorted by print_z whose print_z is closest to `print_z`, searched from the
+// first one above print_z - EPSILON, with its distance. Layers of different objects share a
+// print layer only to within EPSILON, so every lookup keyed by print_z has to resolve a layer
+// the same way. Returns `last` when every element lies below print_z - EPSILON.
+template<typename ForwardIt, typename GetPrintZ>
+std::pair<ForwardIt, coordf_t> closest_print_z(ForwardIt first, ForwardIt last, coordf_t print_z, GetPrintZ get_print_z)
+{
+    ForwardIt it = lower_bound_by_predicate(first, last, [&](const auto &e) { return get_print_z(e) < print_z - EPSILON; });
+    if (it == last)
+        return { last, 0. };
+    coordf_t dist_min = std::abs(get_print_z(*it) - print_z);
+    for (ForwardIt next = std::next(it); next != last; ++ next) {
+        coordf_t d = std::abs(get_print_z(*next) - print_z);
+        if (d >= dist_min)
+            break;
+        dist_min = d;
+        it       = next;
+    }
+    return { it, dist_min };
+}
+
 template<typename ContainerType, typename ValueType> inline bool contains(const ContainerType &c, const ValueType &v)
     { return std::find(c.begin(), c.end(), v) != c.end(); }
 template<typename T> inline bool contains(const std::initializer_list<T> &il, const T &v)

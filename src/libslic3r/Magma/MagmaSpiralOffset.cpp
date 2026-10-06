@@ -1,4 +1,5 @@
 #include "MagmaSpiralOffset.hpp"
+#include "MagmaPatterns.hpp"
 
 #include <cmath>
 #include <algorithm>
@@ -25,12 +26,9 @@ SpiralParams compute_spiral_params(float interior_width, float line_width, float
     constexpr float target_tube_overlap = 0.75f;
     const float max_disp_tube = (1.0f - target_tube_overlap) * interior_width;
 
-    // Constraint 3: Maximum helix angle for injection flow and thin sections.
-    // At low layer heights the per-layer geometric constraints allow the same
-    // horizontal displacement as at thick layers, but over much less vertical
-    // distance, producing a steep helix that resists injection flow and takes
-    // more volumetric space (harder to fit tubes in thin sections).  Cap so
-    // the helix angle never exceeds ~27° (tan(27°) ≈ 0.5).
+    // Constraint 3: Maximum helix angle. The constraints above don't scale with layer height,
+    // so thin layers would otherwise get a steep helix that resists injection flow and needs
+    // more room in thin sections. Cap the angle at ~27° from vertical (tan = 0.5).
     constexpr float MAX_HELIX_TAN = 0.5f;   // tan(~27°)
     const float max_disp_helix = MAX_HELIX_TAN * layer_height;
 
@@ -59,10 +57,12 @@ Vec2d compute_spiral_offset(const SpiralParams &params, int layer_id)
     );
 }
 
-TriangleLattice lattice_for_layer(double cell_spacing, const SpiralParams &params, int layer_id)
+std::shared_ptr<MagmaLattice> lattice_for_layer(
+    InfillPattern pattern, double cell_spacing, const SpiralParams &params, int layer_id,
+    double line_width)
 {
     Vec2d offset = compute_spiral_offset(params, layer_id);
-    return TriangleLattice(cell_spacing, offset.x(), offset.y());
+    return make_magma_lattice(pattern, cell_spacing, offset.x(), offset.y(), line_width);
 }
 
 } // namespace magma

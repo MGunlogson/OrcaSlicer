@@ -27,7 +27,21 @@ public:
     // Produce a textual explanation of the combined effects of the top/bottom_shell_layers
     // versus top/bottom_min_shell_thickness. Which of the two values wins depends
     // on the active layer height.
-    static std::string top_bottom_shell_thickness_explanation(const PresetBundle &preset_bundle);    
+    static std::string top_bottom_shell_thickness_explanation(const PresetBundle &preset_bundle);
+
+    // `text` is the terse "Label:  value" block shown inline on the settings page;
+    // `tooltip` repeats the rows with an explanation of each.
+    struct MagmaReadout {
+        std::string text;
+        std::string tooltip;
+    };
+
+    // Magma: resolved tube geometry (interior width, cell spacing, bore, seal opening, open area).
+    static MagmaReadout magma_geometry_readout(const PresetBundle &preset_bundle);
+
+    // Magma: resolved injection depths (seal depth, corner grip, plunge, total immersion), nozzle vs
+    // cell pitch, estimated dose and injection time.
+    static MagmaReadout magma_injection_readout(const PresetBundle &preset_bundle);
 };
 
 } // namespace Slic3r

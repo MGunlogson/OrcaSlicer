@@ -22,6 +22,12 @@ struct GCodeInputData
     //
     std::vector<PathVertex> vertices;
     //
+    // Magma injection tube geometry, drawn by its own pass (not part of `vertices`).
+    // Each manifold's sub-polylines (hub column, vent legs) are concatenated, separated by a Seam-type vertex.
+    // Tube points are Extrude / MagmaInjection with per-vertex width and the injection layer in `layer_id`.
+    //
+    std::vector<PathVertex> magma_vertices;
+    //
     // Palette for extruders colors
     //
     Palette tools_colors;

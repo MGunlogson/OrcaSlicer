@@ -37,7 +37,7 @@ enum ExtrusionRole : uint8_t {
     erSupportTransition,
     erWipeTower,
     erCustom,
-    // Dual infill zone outer infill (Magma Triangle U-tube pattern)
+    // Dual infill zone outer infill (the Magma U-tube lattice)
     erZoneOuterInfill,
     // Zone shell walls (perimeters between outer and inner zones)
     erZoneShell,
@@ -99,11 +99,23 @@ inline bool is_top_surface(ExtrusionRole role)
     return role == erTopSolidInfill;
 }
 
+// The ordinary role a dual-infill zone role behaves as (for acceleration, jerk, flow ratio, ...).
+// Only zone filament routing and the dual_infill_*_speed overrides need the zone role itself.
+inline ExtrusionRole base_role(ExtrusionRole role)
+{
+    switch (role) {
+    case erZoneShell:        return erPerimeter;        // an inner wall; never seen from outside
+    case erZoneOuterInfill:  return erInternalInfill;   // sparse infill carrying the lattice
+    case erZoneFloor:        return erSolidInfill;      // the zone's solid skins
+    case erZoneCeiling:      return erSolidInfill;
+    default:                 return role;
+    }
+}
+
 inline bool is_solid_infill(ExtrusionRole role)
 {
-    // erZoneOuterInfill excluded — routed to dual_infill_outer_filament
-    // via has_zone_fill() in ToolOrdering. Including it here would mis-route
-    // to solid_infill_filament in multi-extruder setups.
+    // erZoneOuterInfill is excluded: ToolOrdering routes it to dual_infill_outer_filament via
+    // has_zone_fill(), and matching here would send it to solid_infill_filament.
     return role == erBridgeInfill
         || role == erInternalBridgeInfill
         || role == erSolidInfill
@@ -114,10 +126,19 @@ inline bool is_solid_infill(ExtrusionRole role)
         || role == erZoneCeiling;
 }
 
-inline bool is_bridge(ExtrusionRole role) {
+inline bool is_bridge(ExtrusionRole role)
+{
     return role == erBridgeInfill
         || role == erInternalBridgeInfill
         || role == erOverhangPerimeter;
+}
+
+// Orca
+inline bool is_support(ExtrusionRole role)
+{
+    return role == erSupportMaterial
+        || role == erSupportMaterialInterface
+        || role == erSupportTransition;
 }
 
 class ExtrusionEntity
@@ -136,6 +157,9 @@ public:
     virtual void reverse() = 0;
     virtual Point first_point() const = 0;
     virtual Point last_point() const = 0;
+    virtual const Point3& first_point3() const = 0;
+    virtual const Point3& last_point3() const = 0;
+    
     // Produce a list of 2D polygons covered by the extruded paths, offsetted by the extrusion width.
     // Increase the offset by scaled_epsilon to achieve an overlap, so a union will produce no gaps.
     virtual void polygons_covered_by_width(Polygons &out, const float scaled_epsilon) const = 0;
@@ -271,9 +295,9 @@ public:
 	ExtrusionEntity* clone_move() override { return new ExtrusionPath(std::move(*this)); }
     void reverse() override { this->polyline.reverse(); }
     Point first_point() const override { return this->polyline.points.front().to_point(); }
-    Point3 first_point3() const { return this->polyline.points.front(); }
+    const Point3& first_point3() const override { return this->polyline.points.front(); }
     Point last_point() const override { return this->polyline.points.back().to_point(); }
-    Point3 last_point3() const { return this->polyline.points.back(); }
+    const Point3& last_point3() const override { return this->polyline.points.back(); }
     size_t size() const { return this->polyline.size(); }
     bool empty() const { return this->polyline.empty(); }
     bool is_closed() const { return ! this->empty() && this->polyline.points.front() == this->polyline.points.back(); }
@@ -421,7 +445,9 @@ public:
 	ExtrusionEntity* clone_move() override { return new ExtrusionMultiPath(std::move(*this)); }
     void reverse() override;
     Point first_point() const override { return this->paths.front().polyline.points.front().to_point(); }
+    const Point3& first_point3() const override { return this->paths.front().polyline.points.front(); }
     Point last_point() const override { return this->paths.back().polyline.points.back().to_point(); }
+    const Point3& last_point3() const override { return this->paths.back().polyline.points.back(); }
     size_t size() const { return this->paths.size(); }
     bool empty() const { return this->paths.empty(); }
     double length() const override;
@@ -477,7 +503,9 @@ public:
     bool is_counter_clockwise() { return this->polygon().is_counter_clockwise(); }
     void reverse() override;
     Point first_point() const override { return this->paths.front().polyline.points.front().to_point(); }
+    const Point3& first_point3() const override { return this->paths.front().polyline.points.front(); }
     Point last_point() const override { assert(this->first_point() == this->paths.back().polyline.points.back().to_point()); return this->first_point(); }
+    const Point3& last_point3() const override { assert(this->first_point3() == this->paths.back().polyline.points.back()); return this->first_point3(); }
     Polygon polygon() const;
     double length() const override;
     bool split_at_vertex(const Point &point, const double scaled_epsilon = scaled<double>(0.001));
@@ -528,7 +556,7 @@ public:
 
 #ifndef NDEBUG
 	bool validate() const {
-		assert(this->first_point() == this->paths.back().polyline.points.back());
+		assert(this->first_point3() == this->paths.back().polyline.points.back());
 		for (size_t i = 1; i < paths.size(); ++ i)
 			assert(this->paths[i - 1].polyline.points.back() == this->paths[i].polyline.points.front());
 		return true;

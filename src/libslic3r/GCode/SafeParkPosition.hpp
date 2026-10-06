@@ -13,8 +13,7 @@ class GCode;
 class Layer;
 class SupportLayer;
 
-// Priority tier for safe park positions.
-// Lower value = safer (ooze is less likely to affect print quality).
+// Park position tier; lower = ooze is less likely to affect print quality.
 enum class ParkPriority {
     Empty       = 1,  // Outside cumulative object footprint
     Support     = 2,  // Over support on current layer
@@ -30,35 +29,42 @@ struct ParkResult {
     bool needs_z_hop() const { return priority >= ParkPriority::SparseInfill; }
 };
 
-// Maintains cumulative XY object footprint during G-code generation.
-// Multi-object aware: update() merges slices from all objects at each Z.
-// Simplifies polygons (~1mm tolerance) since parking only needs coarse precision.
-//
-// Only the OBJECT footprint is tracked cumulatively. Support, infill type,
-// etc. are checked on the current layer only — support from lower layers
-// is empty space above, not a concern for parking.
+// E word for the park path's raw extra retract / unretract. Relative E emits the delta;
+// absolute E needs a target, since "E-2" at E=850 would be an ~850mm retraction. Both are
+// measured from e_retracted, the E the writer holds after the normal retract, and the
+// unretract returns E there so the writer's own unretract still restores the rest.
+inline double park_extra_retract_e(bool relative_e, double e_retracted, double extra)
+{
+    return relative_e ? -extra : e_retracted - extra;
+}
+inline double park_extra_unretract_e(bool relative_e, double e_retracted, double extra)
+{
+    return relative_e ? extra : e_retracted;
+}
+
+// Finds where to park the nozzle during a temperature change. Tracks the cumulative XY
+// footprint of all objects printed so far, simplified to ~1mm since parking needs only
+// coarse precision. Support and infill type are checked on the current layer only: support
+// on lower layers is empty space at this height.
 class SafeParkPosition {
 public:
-    // Add object layer slices to the cumulative footprint. Call for EACH
-    // object's layer at this Z (process_layer passes vector<LayerToPrint>).
-    // Simplifies layer polygons before accumulating (~1mm tolerance).
+    // Add one object's layer slices to the cumulative footprint; call for each object at this Z.
     void update(const Layer* object_layer);
 
-    // Find safe XY park position near nozzle_pos.
-    // 5-tier priority: empty > support > sparse infill > solid infill > none.
-    // Returns ParkResult with position and priority tier.
+    // Safe XY park position near nozzle_pos, by priority:
+    // empty > support > sparse infill > solid infill > none.
     ParkResult find_safe_position(
         const Layer* object_layer,
         const SupportLayer* support_layer,
         const Point& nozzle_pos,
         coord_t margin = scale_(2.0)) const;
 
-    // Generate G-code to park, change temperature, and return.
-    // Sequence: retract → (z-hop if needed) → XY travel → extra retract → M109 → unretract.
+    // Park and wait for the temperature:
+    // retract -> (z-hop if needed) -> XY travel -> extra retract -> M109 -> extra unretract.
     static std::string park_and_set_temp(
         GCode& gcodegen,
         const ParkResult& park,
-        double layer_z,
+        double print_z,
         double park_z_hop,
         double extra_retract,
         int target_temp,
@@ -66,7 +72,7 @@ public:
         const char* xy_comment);
 
 private:
-    ExPolygons m_cumulative_footprint;  // simplified cumulative OBJECT area only
+    ExPolygons m_cumulative_footprint;  // simplified cumulative object area
 
     // Find nearest centroid in safe regions to nozzle_pos.
     static std::optional<Point> nearest_centroid(

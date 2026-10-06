@@ -302,12 +302,11 @@ static const std::array<Color, size_t(EGCodeExtrusionRole::COUNT)> DEFAULT_EXTRU
     {   0,  59, 110 }, // Brim
     {   0,  64,   0 }, // SupportTransition
     { 128, 128, 128 }, // Mixed
-    // Dual Infill Zones - Volcanic Strata palette
-    { 255,  80,  30 }, // ZoneOuterInfill - Hot Orange (infill channels)
-    { 160,  90,  65 }, // ZoneShell - Clay (earth tone group)
-    { 130,  75,  55 }, // ZoneFloor - Dark Clay (earth tone group)
-    { 185, 110,  75 }, // ZoneCeiling - Sandstone (earth tone group)
-    { 255,  25,   0 }, // MagmaInjection - Molten Lava (brightest)
+    { 255,  80,  30 }, // ZoneOuterInfill
+    { 160,  90,  65 }, // ZoneShell
+    { 130,  75,  55 }, // ZoneFloor
+    { 185, 110,  75 }, // ZoneCeiling
+    { 255,  25,   0 }, // MagmaInjection
 } };
 
 static const std::array<Color, size_t(EOptionType::COUNT)> DEFAULT_OPTIONS_COLORS{ {
@@ -904,21 +903,33 @@ void ViewerImpl::reset()
     delete_buffers(m_heights_widths_angles_buf_id);
     delete_textures(m_positions_tex_id);
     delete_buffers(m_positions_buf_id);
+
+    m_magma_enabled_segments_count = 0;
+    delete_textures(m_magma_enabled_segments_tex_id);
+    delete_buffers(m_magma_enabled_segments_buf_id);
+    delete_textures(m_magma_colors_tex_id);
+    delete_buffers(m_magma_colors_buf_id);
+    delete_textures(m_magma_hwa_tex_id);
+    delete_buffers(m_magma_hwa_buf_id);
+    delete_textures(m_magma_positions_tex_id);
+    delete_buffers(m_magma_positions_buf_id);
 #endif // ENABLE_OPENGL_ES
+    m_magma_vertices.clear();
+    m_magma_valid.clear();
 }
 
 // On some graphic cards texture buffers using GL_RGB32F format do not work, see:
 // https://dev.prusa3d.com/browse/SPE-2411
 // https://github.com/prusa3d/PrusaSlicer/issues/12908
-// To let all drivers be happy, we use GL_RGBA32F format which gives us 4 floats per
-// entry.  Heights_widths_angles: [height, width, junction_angle, frame_angle].
-// frame_angle stores the parallel-transported frame orientation for near-vertical
-// segments (used by the shader for seamless junction rendering).
-// The 4th float of positions is unused (padding only).
+// To let all drivers be happy, we use GL_RGBA32F format.
+// heights_widths_angles = [height, width, junction_angle, frame_angle]; the 4th float of positions is padding.
 using Vec4 = std::array<float, 4>;
 
+// sink_extrusions: beads are recorded at their top, so they are lowered half a height to render centred.
+// Magma tubes pass false: their recorded Z is already the centre-line and their "height" is the bore diameter.
 static void extract_pos_and_or_hwa(const std::vector<PathVertex>& vertices, float travels_radius, float wipes_radius, BitSet<>& valid_lines_bitset,
-    std::vector<Vec4>* positions = nullptr, std::vector<Vec4>* heights_widths_angles = nullptr, bool update_bitset = false) {
+    std::vector<Vec4>* positions = nullptr, std::vector<Vec4>* heights_widths_angles = nullptr, bool update_bitset = false,
+    bool sink_extrusions = true) {
   static constexpr const Vec3 ZERO = { 0.0f, 0.0f, 0.0f };
     if (positions == nullptr && heights_widths_angles == nullptr)
         return;
@@ -932,11 +943,7 @@ static void extract_pos_and_or_hwa(const std::vector<PathVertex>& vertices, floa
     if (heights_widths_angles != nullptr)
         heights_widths_angles->reserve(vertices.size());
 
-    // Track parallel-transported frame for near-vertical paths.
-    // At each vertex in a near-vertical sequence, the transported right vector
-    // is projected perpendicular to the local line direction and its XY angle
-    // is stored in the 4th component.  The shader reads this per-endpoint,
-    // ensuring both sides of each junction share the same orientation.
+    // Parallel-transported cross-section frame along near-vertical runs (see frame_angle below).
     Vec3 transported_right = { 0.0f, -1.0f, 0.0f };
     bool in_near_vertical_seq = false;
 
@@ -963,7 +970,7 @@ static void extract_pos_and_or_hwa(const std::vector<PathVertex>& vertices, floa
         if (positions != nullptr) {
             // the last component is a dummy float to comply with GL_RGBA32F format
             Vec4 position = { v.position[0], v.position[1], v.position[2], 0.0f };
-            if (move_type == EMoveType::Extrude)
+            if (move_type == EMoveType::Extrude && sink_extrusions)
                 // push down extrusion vertices by half height to render them at the right z
                 position[2] -= 0.5f * v.height;
             positions->emplace_back(position);
@@ -984,11 +991,8 @@ static void extract_pos_and_or_hwa(const std::vector<PathVertex>& vertices, floa
                 height = v.height;
                 width = v.width;
             }
-            // Compute junction angle between consecutive segments.
-            // Use the full 3D cross product magnitude for the sine term so that
-            // nearly-vertical segments (tubes) get correct miter joints.
-            // The sign comes from the Z component of the cross product (the 2D
-            // cross product) which gives the turn direction in the XY plane.
+            // Junction angle: the sine term uses the full 3D cross product so near-vertical segments (tubes)
+            // get correct miters; the sign is the XY turn direction (Z of the cross product).
             float junction_angle = 0.0f;
             {
                 const Vec3 c = cross(prev_line, this_line);
@@ -997,11 +1001,6 @@ static void extract_pos_and_or_hwa(const std::vector<PathVertex>& vertices, floa
                 junction_angle = std::atan2(signed_cross, dot(prev_line, this_line));
             }
 
-            // The 4th component of heights_widths_angles serves dual purpose:
-            // - For near-vertical extrusion segments: parallel-transported frame angle
-            // - For wipes/options: z-bias to avoid z-fighting
-            // These are mutually exclusive (wipes/options are never near-vertical).
-
             // ORCA: Set bias for wipes and options to avoid z-fighting
             float bias = 0.0f;
             if (v.is_wipe())
@@ -1009,16 +1008,14 @@ static void extract_pos_and_or_hwa(const std::vector<PathVertex>& vertices, floa
             else if (v.is_option())
                 bias = 0.1f;
 
-            // Compute per-vertex frame angle for near-vertical segments.
-            // Parallel transport maintains a consistent cross-section frame along
-            // near-vertical paths.  Both sides of each segment junction read from
-            // the shared vertex -> same angle -> seamless face connection.
+            // Frame angle for near-vertical segments: both segments meeting at a vertex read the same
+            // transported angle, so their faces join without a seam.
             float frame_angle = 0.0f;
             {
                 bool this_vertex_nv = false;
                 Vec3 transport_dir = ZERO;
 
-                // Check incoming segment
+                // Prefer the incoming segment's direction, else the outgoing one.
                 if (prev_line_valid) {
                     const float plen = length(prev_line);
                     if (plen > 1e-4f) {
@@ -1029,7 +1026,6 @@ static void extract_pos_and_or_hwa(const std::vector<PathVertex>& vertices, floa
                         }
                     }
                 }
-                // Fallback to outgoing segment
                 if (!this_vertex_nv && this_line_valid) {
                     const float tlen = length(this_line);
                     if (tlen > 1e-4f) {
@@ -1046,7 +1042,7 @@ static void extract_pos_and_or_hwa(const std::vector<PathVertex>& vertices, floa
                         transported_right = { 0.0f, -1.0f, 0.0f };
                         in_near_vertical_seq = true;
                     }
-                    // Project right onto plane perpendicular to transport direction
+                    // Project right onto the plane perpendicular to the transport direction.
                     const float d = dot(transported_right, transport_dir);
                     const Vec3 projected = {
                         transported_right[0] - d * transport_dir[0],
@@ -1061,8 +1057,7 @@ static void extract_pos_and_or_hwa(const std::vector<PathVertex>& vertices, floa
                             projected[2] / proj_len
                         };
                     }
-                    // Store absolute XY angle: shader reconstructs as
-                    // line_right_dir = vec3(-sin(theta), -cos(theta), 0.0)
+                    // Must match Shaders.hpp: line_right_dir = vec3(-sin(theta), -cos(theta), 0.0)
                     frame_angle = std::atan2(-transported_right[0], -transported_right[1]);
                 }
                 else {
@@ -1070,11 +1065,13 @@ static void extract_pos_and_or_hwa(const std::vector<PathVertex>& vertices, floa
                 }
             }
 
-            // bias and frame_angle are mutually exclusive; combine into one w component
+            // bias (wipes/options) and frame_angle (near-vertical extrusions) never both apply, so they share w.
             heights_widths_angles->push_back({ height, width, junction_angle, frame_angle + bias });
         }
     }
 }
+
+static float encode_color(const Color& color);
 
 void ViewerImpl::load(GCodeInputData&& gcode_data)
 {
@@ -1087,6 +1084,7 @@ void ViewerImpl::load(GCodeInputData&& gcode_data)
     reset();
 
     m_vertices = std::move(gcode_data.vertices);
+    m_magma_vertices = std::move(gcode_data.magma_vertices);
     m_tool_colors = std::move(gcode_data.tools_colors);
     m_color_print_colors = std::move(gcode_data.color_print_colors);
     m_vertices_colors.resize(m_vertices.size());
@@ -1215,6 +1213,57 @@ void ViewerImpl::load(GCodeInputData&& gcode_data)
 #endif // ENABLE_OPENGL_ES
     }
 
+#ifndef ENABLE_OPENGL_ES
+    // Magma tubes get their own buffers, drawn with the segment shader/template, so the branching
+    // manifold stays out of the toolpath polyline. Seam-type separators in m_magma_vertices split
+    // the hub column from each vent leg so every leg renders as its own capped tube.
+    m_magma_enabled_segments_count = 0;
+    if (!m_magma_vertices.empty() && m_travels_radius > 0.0f && m_wipes_radius > 0.0f) {
+        m_magma_valid = BitSet<>(m_magma_vertices.size());
+        m_magma_valid.setAll();
+        std::vector<Vec4> mpos, mhwa;
+        mpos.reserve(m_magma_vertices.size());
+        mhwa.reserve(m_magma_vertices.size());
+        extract_pos_and_or_hwa(m_magma_vertices, m_travels_radius, m_wipes_radius, m_magma_valid, &mpos, &mhwa, true,
+                               /* sink_extrusions */ false);
+
+        // Taken from the role colour at load; the tube colour buffer is not rebuilt on later colour edits.
+        std::vector<float> mcol(m_magma_vertices.size(), encode_color(get_extrusion_role_color(EGCodeExtrusionRole::MagmaInjection)));
+
+        if (!mpos.empty()) {
+            int old_bound_texture = 0;
+            glsafe(glGetIntegerv(GL_TEXTURE_BINDING_BUFFER, &old_bound_texture));
+
+            glsafe(glGenBuffers(1, &m_magma_positions_buf_id));
+            glsafe(glBindBuffer(GL_TEXTURE_BUFFER, m_magma_positions_buf_id));
+            glsafe(glBufferData(GL_TEXTURE_BUFFER, mpos.size() * sizeof(Vec4), mpos.data(), GL_STATIC_DRAW));
+            glsafe(glGenTextures(1, &m_magma_positions_tex_id));
+            glsafe(glBindTexture(GL_TEXTURE_BUFFER, m_magma_positions_tex_id));
+
+            glsafe(glGenBuffers(1, &m_magma_hwa_buf_id));
+            glsafe(glBindBuffer(GL_TEXTURE_BUFFER, m_magma_hwa_buf_id));
+            glsafe(glBufferData(GL_TEXTURE_BUFFER, mhwa.size() * sizeof(Vec4), mhwa.data(), GL_STATIC_DRAW));
+            glsafe(glGenTextures(1, &m_magma_hwa_tex_id));
+            glsafe(glBindTexture(GL_TEXTURE_BUFFER, m_magma_hwa_tex_id));
+
+            glsafe(glGenBuffers(1, &m_magma_colors_buf_id));
+            glsafe(glBindBuffer(GL_TEXTURE_BUFFER, m_magma_colors_buf_id));
+            glsafe(glBufferData(GL_TEXTURE_BUFFER, mcol.size() * sizeof(float), mcol.data(), GL_STATIC_DRAW));
+            glsafe(glGenTextures(1, &m_magma_colors_tex_id));
+            glsafe(glBindTexture(GL_TEXTURE_BUFFER, m_magma_colors_tex_id));
+
+            // Filled in update_enabled_entities().
+            glsafe(glGenBuffers(1, &m_magma_enabled_segments_buf_id));
+            glsafe(glBindBuffer(GL_TEXTURE_BUFFER, m_magma_enabled_segments_buf_id));
+            glsafe(glGenTextures(1, &m_magma_enabled_segments_tex_id));
+            glsafe(glBindTexture(GL_TEXTURE_BUFFER, m_magma_enabled_segments_tex_id));
+
+            glsafe(glBindBuffer(GL_TEXTURE_BUFFER, 0));
+            glsafe(glBindTexture(GL_TEXTURE_BUFFER, old_bound_texture));
+        }
+    }
+#endif // ENABLE_OPENGL_ES
+
     update_view_full_range();
     m_view_range.set_visible(m_view_range.get_enabled());
     update_enabled_entities();
@@ -1303,6 +1352,39 @@ void ViewerImpl::update_enabled_entities()
     else
         glsafe(glBufferData(GL_TEXTURE_BUFFER, 0, nullptr, GL_STATIC_DRAW));
 
+    // Magma tubes: reveal each manifold as the move slider reaches its injection.
+    if (m_magma_enabled_segments_buf_id != 0 && !m_magma_vertices.empty() && !m_vertices.empty()) {
+        const size_t   head       = std::min<size_t>(range[1], m_vertices.size() - 1);
+        const uint32_t reveal_max = m_vertices[head].gcode_id;
+        const uint32_t head_layer = m_vertices[head].layer_id;
+        const bool     magma_vis  = m_settings.extrusion_roles_visibility[size_t(EGCodeExtrusionRole::MagmaInjection)];
+
+        // Tube vertices carry synthetic gcode ids (injection line + fill step, see FILL_SPAN in
+        // GCodeProcessor.cpp) so a tube fills progressively as the head advances. Those ids can run
+        // past the layer's last real move, so tubes on finished layers are shown whole regardless.
+        const bool layer_complete = (head + 1 >= m_vertices.size()) ||
+                                    (m_vertices[head + 1].layer_id != head_layer);
+
+        std::vector<uint32_t> menabled;
+        menabled.reserve(m_magma_vertices.size());
+        if (magma_vis)
+            for (size_t i = 0; i + 1 < m_magma_vertices.size(); ++i) {
+                const PathVertex &mv = m_magma_vertices[i];
+                if (!m_magma_valid[i] || mv.type != EMoveType::Extrude)
+                    continue;
+                const bool finished_layer = mv.layer_id < head_layer ||
+                                            (layer_complete && mv.layer_id == head_layer);
+                if (finished_layer || mv.gcode_id <= reveal_max)
+                    menabled.push_back(static_cast<uint32_t>(i));
+            }
+        m_magma_enabled_segments_count = menabled.size();
+        glsafe(glBindBuffer(GL_TEXTURE_BUFFER, m_magma_enabled_segments_buf_id));
+        if (!menabled.empty())
+            glsafe(glBufferData(GL_TEXTURE_BUFFER, menabled.size() * sizeof(uint32_t), menabled.data(), GL_STATIC_DRAW));
+        else
+            glsafe(glBufferData(GL_TEXTURE_BUFFER, 0, nullptr, GL_STATIC_DRAW));
+    }
+
     glsafe(glBindBuffer(GL_TEXTURE_BUFFER, 0));
 #endif // ENABLE_OPENGL_ES
 
@@ -1313,6 +1395,16 @@ static float encode_color(const Color& color) {
     const int r = static_cast<int>(color[0]);
     const int g = static_cast<int>(color[1]);
     const int b = static_cast<int>(color[2]);
+    const int i_color = r << 16 | g << 8 | b;
+    return static_cast<float>(i_color);
+}
+
+// ORCA: returns the encoded color scaled towards black by 'brightness', preserving its hue.
+// 1.0 = no change, 0.0 = black.
+static float encode_color_dimmed(const Color& color, float brightness) {
+    const int r = static_cast<int>(color[0] * brightness);
+    const int g = static_cast<int>(color[1] * brightness);
+    const int b = static_cast<int>(color[2] * brightness);
     const int i_color = r << 16 | g << 8 | b;
     return static_cast<float>(i_color);
 }
@@ -1328,14 +1420,39 @@ void ViewerImpl::update_colors_texture()
     const size_t top_layer_id = m_settings.top_layer_only_view_range ? m_layers.get_view_range()[1] : 0;
     const bool color_top_layer_only = m_view_range.get_full()[1] != m_view_range.get_visible()[1];
 
+    // ORCA: when dim_previous_layers is enabled, darken every layer (keeping its color) except the
+    // one(s) the layer slider is being scrubbed to, so that only those are shown at full brightness.
+    // A slider thumb marks a layer as inspected only once it is moved away from
+    // its end of the print: the upper one while it is below the last layer (or while the moves
+    // slider is not at the end of the layer), the lower one while it is above the first layer, so
+    // trimming the print from the bottom lights up the lowest visible layer and using the slider as
+    // a range lights up both ends. When neither thumb is moved the whole print is rendered normally.
+    // Gated on top-layer-only mode, which the greying path below also keys off of, so that the moves
+    // slider still animates normally across all layers when that mode is disabled.
+    const Interval& layers_range = m_layers.get_view_range();
+    const bool inspecting_top_layer = layers_range[1] + 1 < m_layers.count() || color_top_layer_only;
+    const bool inspecting_bottom_layer = layers_range[0] > 0;
+    const bool dim_previous_layers = m_settings.dim_previous_layers && m_settings.top_layer_only_view_range &&
+                                     !m_layers.empty() && (inspecting_top_layer || inspecting_bottom_layer);
+
     // Based on current settings and slider position, we might want to render some
-    // vertices as dark grey. Use either that or the normal color (from the cache).
+    // vertices as dark grey (or darkened, see above). Use either that or the normal color (from the cache).
     std::vector<float> colors(m_vertices_colors.size());
     assert(colors.size() == m_vertices.size() && m_vertices_colors.size() == m_vertices.size());
-    for (size_t i=0; i<m_vertices.size(); ++i)
-        colors[i] = (color_top_layer_only && m_vertices[i].layer_id < top_layer_id &&
-                    (!m_settings.spiral_vase_mode || i != m_view_range.get_enabled()[0])) ?
-                    encode_color(DUMMY_COLOR) : m_vertices_colors[i];
+    for (size_t i=0; i<m_vertices.size(); ++i) {
+        const PathVertex& v = m_vertices[i];
+        const bool keep_spiral_seam = m_settings.spiral_vase_mode && i == m_view_range.get_enabled()[0];
+        // ORCA: layers kept at full brightness by the dimming above are excluded from the greying below too
+        const bool inspected_layer = dim_previous_layers &&
+                                     ((inspecting_top_layer && v.layer_id == layers_range[1]) ||
+                                      (inspecting_bottom_layer && v.layer_id == layers_range[0]));
+        if (dim_previous_layers && !inspected_layer && !keep_spiral_seam)
+            colors[i] = encode_color_dimmed(get_vertex_color(v), m_settings.dim_previous_layers_brightness);
+        else if (!inspected_layer && color_top_layer_only && v.layer_id < top_layer_id && !keep_spiral_seam)
+            colors[i] = encode_color(DUMMY_COLOR);
+        else
+            colors[i] = m_vertices_colors[i];
+    }
 
     #ifdef ENABLE_OPENGL_ES
         if (!colors.empty())
@@ -1394,6 +1511,7 @@ void ViewerImpl::render(const Mat4x4& view_matrix, const Mat4x4& projection_matr
     const Mat4x4 inv_view_matrix = inverse(view_matrix);
     const Vec3 camera_position = { inv_view_matrix[12], inv_view_matrix[13], inv_view_matrix[14] };
     render_segments(view_matrix, projection_matrix, camera_position);
+    render_magma_segments(view_matrix, projection_matrix, camera_position);
     render_options(view_matrix, projection_matrix);
 
 #if VGCODE_ENABLE_COG_AND_TOOL_MARKERS
@@ -1441,6 +1559,27 @@ void ViewerImpl::toggle_top_layer_only_view_range()
     m_settings.update_enabled_entities = true;
     //m_settings.update_colors = true;
     update_colors_texture();
+}
+
+// ORCA: enable/disable darkening of the layers the layer slider is not scrubbed to
+void ViewerImpl::set_dim_previous_layers(bool value)
+{
+    if (m_settings.dim_previous_layers == value)
+        return;
+    m_settings.dim_previous_layers = value;
+    // defer the actual color/texture rebuild to the next render(), when the GL context is current
+    // (this may be toggled from the Preferences dialog, outside the canvas context)
+    m_settings.update_colors = true;
+}
+
+// ORCA: set how bright the darkened layers are rendered, 1.0 = unchanged, 0.0 = black
+void ViewerImpl::set_dim_previous_layers_brightness(float value)
+{
+    value = std::clamp(value, 0.0f, 1.0f);
+    if (m_settings.dim_previous_layers_brightness == value)
+        return;
+    m_settings.dim_previous_layers_brightness = value;
+    m_settings.update_colors = true;
 }
 
 std::vector<ETimeMode> ViewerImpl::get_time_modes() const
@@ -2090,6 +2229,67 @@ void ViewerImpl::render_segments(const Mat4x4& view_matrix, const Mat4x4& projec
     }
 #endif // ENABLE_OPENGL_ES
     glsafe(glActiveTexture(curr_active_texture));
+}
+
+void ViewerImpl::render_magma_segments(const Mat4x4& view_matrix, const Mat4x4& projection_matrix, const Vec3& camera_position)
+{
+#ifndef ENABLE_OPENGL_ES
+    // Draws the magma tubes with the segment shader bound to the magma buffers.
+    // Which segments are drawn (role visibility, move slider) is decided in update_enabled_entities().
+    if (m_segments_shader_id == 0 || m_magma_enabled_segments_count == 0)
+        return;
+    if (!m_settings.extrusion_roles_visibility[size_t(EGCodeExtrusionRole::MagmaInjection)])
+        return;
+
+    int curr_active_texture = 0;
+    glsafe(glGetIntegerv(GL_ACTIVE_TEXTURE, &curr_active_texture));
+    int curr_shader = 0;
+    glsafe(glGetIntegerv(GL_CURRENT_PROGRAM, &curr_shader));
+    const bool curr_cull_face = glIsEnabled(GL_CULL_FACE);
+    glcheck();
+
+    glsafe(glUseProgram(m_segments_shader_id));
+    glsafe(glUniform1i(m_uni_segments_positions_tex_id, 0));
+    glsafe(glUniform1i(m_uni_segments_height_width_angle_tex_id, 1));
+    glsafe(glUniform1i(m_uni_segments_colors_tex_id, 2));
+    glsafe(glUniform1i(m_uni_segments_segment_index_tex_id, 3));
+    glsafe(glUniformMatrix4fv(m_uni_segments_view_matrix_id, 1, GL_FALSE, view_matrix.data()));
+    glsafe(glUniformMatrix4fv(m_uni_segments_projection_matrix_id, 1, GL_FALSE, projection_matrix.data()));
+    glsafe(glUniform3fv(m_uni_segments_camera_position_id, 1, camera_position.data()));
+    glsafe(glDisable(GL_CULL_FACE));
+
+    std::array<int, 4> curr_bound_texture = { 0, 0, 0, 0 };
+    for (int i = 0; i < (int)curr_bound_texture.size(); ++i) {
+        glsafe(glActiveTexture(GL_TEXTURE0 + i));
+        glsafe(glGetIntegerv(GL_TEXTURE_BINDING_BUFFER, &curr_bound_texture[i]));
+    }
+
+    glsafe(glActiveTexture(GL_TEXTURE0));
+    glsafe(glBindTexture(GL_TEXTURE_BUFFER, m_magma_positions_tex_id));
+    glsafe(glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA32F, m_magma_positions_buf_id));
+    glsafe(glActiveTexture(GL_TEXTURE1));
+    glsafe(glBindTexture(GL_TEXTURE_BUFFER, m_magma_hwa_tex_id));
+    glsafe(glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA32F, m_magma_hwa_buf_id));
+    glsafe(glActiveTexture(GL_TEXTURE2));
+    glsafe(glBindTexture(GL_TEXTURE_BUFFER, m_magma_colors_tex_id));
+    glsafe(glTexBuffer(GL_TEXTURE_BUFFER, GL_R32F, m_magma_colors_buf_id));
+    glsafe(glActiveTexture(GL_TEXTURE3));
+    glsafe(glBindTexture(GL_TEXTURE_BUFFER, m_magma_enabled_segments_tex_id));
+    glsafe(glTexBuffer(GL_TEXTURE_BUFFER, GL_R32UI, m_magma_enabled_segments_buf_id));
+
+    m_segment_template.render(m_magma_enabled_segments_count);
+
+    if (curr_cull_face)
+        glsafe(glEnable(GL_CULL_FACE));
+    glsafe(glUseProgram(curr_shader));
+    for (int i = 0; i < (int)curr_bound_texture.size(); ++i) {
+        glsafe(glActiveTexture(GL_TEXTURE0 + i));
+        glsafe(glBindTexture(GL_TEXTURE_BUFFER, curr_bound_texture[i]));
+    }
+    glsafe(glActiveTexture(curr_active_texture));
+#else
+    (void)view_matrix; (void)projection_matrix; (void)camera_position;
+#endif // ENABLE_OPENGL_ES
 }
 
 void ViewerImpl::render_options(const Mat4x4& view_matrix, const Mat4x4& projection_matrix)

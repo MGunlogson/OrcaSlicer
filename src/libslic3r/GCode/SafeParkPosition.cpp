@@ -1,5 +1,7 @@
 #include "SafeParkPosition.hpp"
 
+#include <algorithm>
+
 #include "../GCode.hpp"
 #include "../Layer.hpp"
 #include "../ClipperUtils.hpp"
@@ -13,25 +15,16 @@
 
 namespace Slic3r {
 
-// ============================================================================
-// SafeParkPosition — update
-// ============================================================================
-
 void SafeParkPosition::update(const Layer* object_layer)
 {
     if (!object_layer || object_layer->lslices.empty())
         return;
-    // Simplify polygons before accumulating (same pattern as TreeSupport).
-    // 1mm tolerance prevents vertex explosion across hundreds of layers.
+    // Simplify before accumulating so the union doesn't grow vertices over hundreds of layers.
     ExPolygons simplified;
     for (const ExPolygon& poly : object_layer->lslices)
         poly.simplify(scale_(SIMPLIFY_TOLERANCE), &simplified);
     m_cumulative_footprint = union_ex(m_cumulative_footprint, simplified);
 }
-
-// ============================================================================
-// SafeParkPosition — nearest_centroid
-// ============================================================================
 
 std::optional<Point> SafeParkPosition::nearest_centroid(
     const ExPolygons& safe_regions, const Point& nozzle_pos)
@@ -52,10 +45,6 @@ std::optional<Point> SafeParkPosition::nearest_centroid(
 
     return found ? std::optional<Point>(best) : std::nullopt;
 }
-
-// ============================================================================
-// SafeParkPosition — find_safe_position
-// ============================================================================
 
 ParkResult SafeParkPosition::find_safe_position(
     const Layer* object_layer,
@@ -132,14 +121,10 @@ ParkResult SafeParkPosition::find_safe_position(
     return {};
 }
 
-// ============================================================================
-// SafeParkPosition — park_and_set_temp
-// ============================================================================
-
 std::string SafeParkPosition::park_and_set_temp(
     GCode& gcodegen,
     const ParkResult& park,
-    double layer_z,
+    double print_z,
     double park_z_hop,
     double extra_retract,
     int target_temp,
@@ -149,7 +134,18 @@ std::string SafeParkPosition::park_and_set_temp(
     std::string gcode;
     char buf[256];
 
+    const bool relative_e = gcodegen.config().use_relative_e_distances.value;
+    const int park_e_feedrate = (gcodegen.writer().filament() != nullptr)
+                                    ? std::max(60, gcodegen.writer().filament()->retract_speed() * 60)
+                                    : 1800;
+
+    // The nozzle prints this layer at print_z + z_offset (GCode::change_layer), so the hop is
+    // measured from there.
+    const double layer_z = print_z + gcodegen.config().z_offset.value;
+
     gcode += gcodegen.retract(false, false);
+    const double e_retracted = (gcodegen.writer().filament() != nullptr)
+                                   ? gcodegen.writer().filament()->E() : 0.0;
 
     if (park.position) {
         // Z-hop only when parking over printed material (Priority 3+).
@@ -161,15 +157,16 @@ std::string SafeParkPosition::park_and_set_temp(
         gcode += gcodegen.writer().travel_to_xy(
             gcodegen.point_to_gcode(*park.position), xy_comment);
 
-        // Extra retraction beyond the normal retract (already performed above).
-        // Uses raw G1 E because writer().retract() would no-op (already retracted).
-        // The symmetric unretract below restores E to the position the state machine expects.
+        // Extra retraction, emitted raw because GCodeWriter::retract() no-ops once already
+        // retracted. The raw E must respect the E mode; see park_extra_retract_e().
         if (extra_retract > 0) {
-            snprintf(buf, sizeof(buf), "G1 E-%.4f F1800 ; park extra retract\n", extra_retract);
+            snprintf(buf, sizeof(buf), "G1 E%.4f F%d ; park extra retract\n",
+                     park_extra_retract_e(relative_e, e_retracted, extra_retract),
+                     park_e_feedrate);
             gcode += buf;
         }
     } else {
-        // No safe XY — z-hop only as fallback.
+        // No safe XY: z-hop only.
         double park_z = layer_z + park_z_hop;
         gcode += gcodegen.writer().travel_to_z(park_z, z_comment);
     }
@@ -177,7 +174,9 @@ std::string SafeParkPosition::park_and_set_temp(
     gcode += gcodegen.writer().set_temperature(target_temp, true);
 
     if (park.position && extra_retract > 0) {
-        snprintf(buf, sizeof(buf), "G1 E%.4f F1800 ; park extra unretract\n", extra_retract);
+        snprintf(buf, sizeof(buf), "G1 E%.4f F%d ; park extra unretract\n",
+                 park_extra_unretract_e(relative_e, e_retracted, extra_retract),
+                 park_e_feedrate);
         gcode += buf;
     }
 

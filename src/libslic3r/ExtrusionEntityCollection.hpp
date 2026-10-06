@@ -74,9 +74,8 @@ public:
     {
         return std::any_of(entities.begin(), entities.end(), [](const ExtrusionEntity* ee) { return is_solid_infill(ee->role()); });
     }
-    // Checks for outer zone infill (Magma Triangle) only. Other zone roles route
-    // through standard filament selection: zone shell → wall_filament (lives in
-    // perimeters, not fills), floor/ceiling → solid_infill_filament (via is_solid_infill()).
+    // Outer zone infill only. Zone shells are perimeters (wall filament) and floor/ceiling use
+    // solid infill filament via is_solid_infill().
     bool has_zone_fill() const
     {
         return std::any_of(entities.begin(), entities.end(), [](const ExtrusionEntity* ee) {
@@ -128,7 +127,10 @@ public:
     	{ return this->no_sort ? *this : chained_path_from(this->entities, start_near, role); }
     void reverse() override;
     Point first_point() const override { return this->entities.front()->first_point(); }
+    const Point3& first_point3() const override { return this->entities.front()->first_point3(); }
     Point last_point() const override { return this->entities.back()->last_point(); }
+    const Point3& last_point3() const override { return this->entities.back()->last_point3(); }
+
     // Produce a list of 2D polygons covered by the extruded paths, offsetted by the extrusion width.
     // Increase the offset by scaled_epsilon to achieve an overlap, so a union will produce no gaps.
     void polygons_covered_by_width(Polygons &out, const float scaled_epsilon) const override;

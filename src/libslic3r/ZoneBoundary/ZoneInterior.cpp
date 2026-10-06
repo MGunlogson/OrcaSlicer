@@ -20,15 +20,13 @@ namespace zone_boundary {
 
 void smooth_interior(sla::Interior &interior, const TriangleMesh &original_mesh, int iterations)
 {
-    // Note: interior.mesh may be empty if filter_thin_interior() was called first
-    // We only need the grid for smoothing - mesh is regenerated at the end
+    // Works on the grid only; interior.mesh may already be cleared by filter_thin_interior().
     if (!interior.gridptr || iterations <= 0)
         return;
 
     BOOST_LOG_TRIVIAL(info) << "Zone boundary: Applying constrained smoothing (" << iterations << " iterations)";
 
-    // Create grid from original mesh at same voxel scale for clamping constraint.
-    // The valid zone is the original mesh offset inward by shell thickness.
+    // Clamping constraint: the original mesh, at the same voxel scale, offset inward by the shell thickness.
     float voxel_scale = float(interior.voxel_scale);
     float out_range = 3.0f;
     float in_range = float(interior.nb_in);
@@ -39,9 +37,6 @@ void smooth_interior(sla::Interior &interior, const TriangleMesh &original_mesh,
         return;
     }
 
-    // The valid zone grid: original mesh offset inward by thickness.
-    // In SDF terms, we add the thickness offset to shift the zero level-set inward.
-    // valid_zone_grid represents the boundary that the interior must not cross.
     double thickness_offset = interior.thickness;
     auto valid_zone_grid = redistance_grid(*original_grid, -thickness_offset, in_range, in_range);
     if (!valid_zone_grid) {
@@ -49,25 +44,12 @@ void smooth_interior(sla::Interior &interior, const TriangleMesh &original_mesh,
         return;
     }
 
-    // Apply constrained mean curvature smoothing iterations.
-    // Each iteration: multiple smooth passes, then clamp to valid zone.
-    // Batching smooth passes before clamping is more effective because:
-    // - Mean curvature shrinks bumps INWARD (convex -> shrink)
-    // - Clamping only prevents OUTWARD expansion (into shell zone)
-    // - Clamping does NOT block bump removal
-    // - Batching = more effective smoothing per CSG operation
-    //
-    // We use csgIntersectionCopy which:
-    // - Takes const references (doesn't destroy valid_zone_grid)
-    // - Maintains proper level set semantics (signedFloodFill, narrow band)
-    // - Is internally parallelized with TBB
+    // Each iteration runs several smoothing passes, then clamps to the valid zone. Mean curvature
+    // shrinks bumps inward and the clamp only blocks outward growth into the shell, so batching
+    // passes loses nothing and saves CSG operations.
+    const int smooth_passes_per_clamp = 5;
 
-    const int smooth_passes_per_clamp = 5;  // Batch 5 smooth passes before clamping
-
-    // Convergence detection via L1 energy (sum of |SDF| over all active voxels).
-    // This is an O(N) read-only pass — trivial overhead vs the O(N) smoothing passes
-    // with heavy per-voxel computation. Covers ALL voxels, so sharp features that
-    // affect few voxels but change significantly are still detected proportionally.
+    // Convergence measure: sum of |SDF| over all active voxels. Cheap next to the smoothing passes.
     auto compute_l1_energy = [&]() -> double {
         double energy = 0;
         for (auto iter = interior.gridptr->cbeginValueOn(); iter; ++iter)
@@ -89,17 +71,15 @@ void smooth_interior(sla::Interior &interior, const TriangleMesh &original_mesh,
 
         openvdb::tools::LevelSetFilter<openvdb::FloatGrid> filter(*interior.gridptr);
 
-        // Apply multiple smoothing passes before clamping
         for (int j = 0; j < smooth_passes_per_clamp; ++j) {
             filter.meanCurvature();
         }
 
-        // Clamp to valid zone using csgIntersectionCopy (preserves both inputs)
+        // csgIntersectionCopy leaves valid_zone_grid intact for the next iteration.
         interior.gridptr = openvdb::tools::csgIntersectionCopy(*interior.gridptr, *valid_zone_grid);
 
         ++actual_iterations;
 
-        // Convergence check: relative change in L1 energy
         double curr_energy = compute_l1_energy();
         double rel_change = (prev_energy > 0) ? std::abs(curr_energy - prev_energy) / prev_energy : 0;
 
@@ -109,9 +89,8 @@ void smooth_interior(sla::Interior &interior, const TriangleMesh &original_mesh,
         BOOST_LOG_TRIVIAL(debug) << "Zone boundary: Smooth iter " << (i + 1) << "/" << iterations
             << " " << iter_ms << "ms, L1=" << curr_energy << ", rel_change=" << rel_change;
 
-        // Plateau detection: if rel_change stopped decreasing, the smooth/clamp
-        // cycle has reached equilibrium. No fixed threshold — adapts to the model.
-        // Skip iter 0 (first iteration is always a large initial change).
+        // Stop once the relative change no longer halves per iteration: smoothing and clamping
+        // have reached equilibrium. The first iteration is always a large change, so skip it.
         if (i > 0 && prev_rel_change > 0 && rel_change >= 0.5 * prev_rel_change) {
             BOOST_LOG_TRIVIAL(info) << "Zone boundary: Smooth plateaued at iteration " << (i + 1)
                 << "/" << iterations << " (rel_change=" << rel_change << ")";
@@ -127,7 +106,6 @@ void smooth_interior(sla::Interior &interior, const TriangleMesh &original_mesh,
     BOOST_LOG_TRIVIAL(info) << "Zone boundary: Smooth complete: " << actual_iterations
         << "/" << iterations << " iterations in " << smooth_ms << "ms";
 
-    // Convert smoothed grid back to mesh
     double adaptivity = 0.;
     interior.mesh = grid_to_mesh(*interior.gridptr, 0.0, adaptivity);
 
@@ -144,31 +122,26 @@ void filter_thin_interior(sla::Interior &interior, double min_width)
 
     BOOST_LOG_TRIVIAL(info) << "Zone boundary: Filtering thin inner zone sections (min width: " << min_width << "mm)";
 
-    // Convert min_width to voxel scale
-    // The threshold is half the min_width (radius of inscribed sphere)
+    // Inscribed sphere radius, in voxels
     float threshold = float(min_width / 2.0 * interior.voxel_scale);
     int threshold_voxels = int(std::ceil(threshold));
 
-    // 1. Extract mask of "thick core" - voxels where inscribed sphere radius >= threshold
-    //    sdfInteriorMask returns mask where SDF <= isovalue
-    //    Negative threshold = voxels at least threshold from boundary
+    // Thick core: voxels at least `threshold` inside the surface (SDF <= -threshold).
     auto thick_mask = openvdb::tools::sdfInteriorMask(*interior.gridptr, -threshold);
 
     if (!thick_mask || thick_mask->tree().activeVoxelCount() == 0) {
-        // No thick regions survive - clear the interior
         BOOST_LOG_TRIVIAL(warning) << "Zone boundary: No regions thick enough to survive filtering (min_width=" << min_width << "mm)";
         interior.gridptr->clear();
         interior.mesh.clear();
         return;
     }
 
-    // 2. Dilate mask back to reach original surface (BINARY dilation = EXACT)
+    // Dilate the core back out to the original surface.
     openvdb::tools::dilateActiveValues(thick_mask->tree(), threshold_voxels,
                                         openvdb::tools::NN_FACE_EDGE_VERTEX,
                                         openvdb::tools::PRESERVE_TILES);
 
-    // 3. Use mask to carve original level set
-    //    Keep original SDF where mask is active, set to background (outside) elsewhere
+    // Outside the mask, set voxels to background (outside); inside it keep the original SDF.
     float background = interior.gridptr->background();
     size_t removed_count = 0;
     size_t kept_count = 0;
@@ -176,17 +149,16 @@ void filter_thin_interior(sla::Interior &interior, double min_width)
     for (auto iter = interior.gridptr->beginValueOn(); iter; ++iter) {
         openvdb::Coord coord = iter.getCoord();
         if (!thick_mask->tree().isValueOn(coord)) {
-            iter.setValue(background);  // Set to outside
+            iter.setValue(background);
             removed_count++;
         } else {
             kept_count++;
         }
     }
 
-    // Prune inactive voxels
     openvdb::tools::pruneInactive(interior.gridptr->tree());
 
-    // Clear stale mesh - smooth_interior() will regenerate it
+    // Stale; smooth_interior() regenerates it.
     interior.mesh.clear();
 
     BOOST_LOG_TRIVIAL(info) << "Zone boundary: Thin inner zone filtering complete (kept " << kept_count << " voxels)";

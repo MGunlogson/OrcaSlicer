@@ -82,8 +82,7 @@ using enable_if_t = typename std::enable_if<B, T>::type;
 
 template<class F, class...Args>
 struct invoke_result {
-    // std::result_of was deprecated in C++17 and removed in C++20.
-    // std::invoke_result is the standard C++17+ replacement.
+    // std::result_of is removed in C++20.
     using type = typename std::invoke_result<F, Args...>::type;
 };
 

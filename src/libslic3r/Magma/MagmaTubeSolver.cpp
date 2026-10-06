@@ -9,6 +9,10 @@
 #include <cmath>
 #include <iomanip>
 #include <limits>
+#include <sstream>
+#include <array>
+#include <map>
+#include <set>
 
 // OR-Tools CP-SAT solver
 #include "ortools/sat/cp_model.h"
@@ -18,57 +22,77 @@
 namespace Slic3r {
 namespace magma {
 
+// Alias rather than a using-directive: operations_research::sat::Model would clash with
+// Slic3r::Model.
+namespace ortsat = operations_research::sat;
+
+double min_positive_layer_height(const std::vector<LayerData> &layer_data, int first_layer)
+{
+    double min_lh = 0.0;
+    for (int L = std::max(0, first_layer); L < int(layer_data.size()); ++L)
+        if (layer_data[L].height > 0 && (min_lh <= 0.0 || layer_data[L].height < min_lh))
+            min_lh = layer_data[L].height;
+    return min_lh;
+}
+
 // ============================================================================
 // Constructor
 // ============================================================================
 
 MagmaTubeSolver::MagmaTubeSolver(
-    const std::unordered_map<TriangleCell, CellPresence, TriangleCellHash> &cells,
+    const MagmaLattice &lattice,
+    const std::unordered_map<CellId, CellPresence, CellIdHash> &cells,
     const std::vector<LayerData> &layer_data,
+    int    first_layer,
     double min_tube_height_mm,
     double max_tube_height_mm,
     int    num_layers,
-    double dodge_distance_mm,
     MagmaTubeSolverMode mode,
     double solver_timeout_sec)
-    : m_cells(cells)
+    : m_lattice(lattice)
+    , m_cells(cells)
     , m_layer_data(layer_data)
     , m_min_h_mm(min_tube_height_mm)
     , m_max_h_mm(max_tube_height_mm)
     , m_num_layers(num_layers)
+    , m_first_layer(std::max(0, first_layer))
     , m_z_window(0)
-    , m_dodge_mm(dodge_distance_mm)
     , m_mode(mode)
     , m_timeout_sec(solver_timeout_sec)
 {}
 
 // ============================================================================
-// solve — 3-pass driver
+// solve — greedy warm start, then one CP-SAT sweep over all blocks
 // ============================================================================
 
 void MagmaTubeSolver::solve(
     std::vector<UTubePair> &out_pairs,
-    std::unordered_map<TriangleCell, std::vector<int>, TriangleCellHash> &out_cell_pair_index,
+    std::unordered_map<CellId, std::vector<int>, CellIdHash> &out_cell_pair_index,
     ProgressFn progress_fn,
     ThrowIfCanceled throw_if_canceled)
 {
     auto t_start = std::chrono::high_resolution_clock::now();
 
+    // Smallest layer height, for a conservative layer count per tube. Only non-positive with no
+    // layers at all, and then there is nothing to assign.
+    const double min_lh = min_positive_layer_height(m_layer_data, m_first_layer);
+    if (min_lh <= 0.0) {
+        BOOST_LOG_TRIVIAL(error) << "Magma solver: no layer with a positive height; "
+                                    "skipping tube assignment.";
+        return;
+    }
+
     build_micron_tables();
     build_edges();
     if (throw_if_canceled) throw_if_canceled();
 
-    // Greedy warm start: fast heuristic that populates m_committed with a good
-    // initial solution. CP-SAT then refines it via warm start hints.
+    // Greedy fills m_committed; CP-SAT then refines it, using it as a solution hint.
     {
         const int64_t min_h_um = llround(m_min_h_mm * 1000.0);
         const int64_t max_h_um = llround(m_max_h_mm * 1000.0);
-        greedy_warm_start(m_cells, m_edges, m_cell_edges, m_um,
-                          min_h_um, max_h_um, m_committed,
-                          &m_cell_difficulty);
-        validate_committed(m_edges, m_edge_index, m_committed, m_cells,
-                           m_um, m_layer_data, m_min_h_mm, m_max_h_mm,
-                           m_num_layers, "GREEDY");
+        greedy_warm_start(m_lattice, m_cells, m_edges, m_cell_edges, m_um,
+                          min_h_um, max_h_um, m_committed);
+        validate_and_report("GREEDY");
     }
     if (throw_if_canceled) throw_if_canceled();
 
@@ -76,13 +100,8 @@ void MagmaTubeSolver::solve(
     //   window  = 4 × max_h_layers  — room for 3-4 stacked tubes
     //   overlap = 2 × max_h_layers  — every tube fully in ≥2 Z levels
     //   stride  = 2 × max_h_layers  — window minus overlap
-    // Uses smallest layer height for conservative layer count.
     int z_stride;
     {
-        double min_lh = m_layer_data.empty() ? 0.2 : m_layer_data[0].height;
-        for (const auto &ld : m_layer_data)
-            if (ld.height > 0 && ld.height < min_lh)
-                min_lh = ld.height;
         int max_h_layers = std::max(1, static_cast<int>(std::ceil(m_max_h_mm / min_lh)));
         m_z_window = 4 * max_h_layers;
         z_stride   = std::max(1, 2 * max_h_layers);
@@ -100,14 +119,18 @@ void MagmaTubeSolver::solve(
     // Give CP-SAT all available cores (blocks run sequentially).
     m_cpsat_workers = tbb::this_task_arena::max_concurrency();
 
-    // Pre-count blocks to compute per-block timeout from total budget.
-    // Single XY pass per Z level with R_OVERLAP-cell overlap between blocks.
+    // Blocks depend only on immutable state, so build them once up front; the total also
+    // sizes the time budget.
+    std::vector<std::vector<Block>> z_levels;
     int total_blocks = 0;
     for (int z_off = 0; z_off <= max_edge_layer; z_off += z_stride) {
-        std::vector<Block> temp;
-        build_blocks(0, 0, z_off, temp);
-        total_blocks += static_cast<int>(temp.size());
+        std::vector<Block> level;
+        build_blocks(z_off, level);
+        total_blocks += static_cast<int>(level.size());
+        z_levels.push_back(std::move(level));
     }
+    m_budget_left_sec   = m_timeout_sec;
+    m_blocks_left       = total_blocks;
     m_per_block_timeout = m_timeout_sec / std::max(1, total_blocks);
 
     BOOST_LOG_TRIVIAL(info) << "MagmaTubeSolver: " << m_edges.size() << " edges"
@@ -116,29 +139,27 @@ void MagmaTubeSolver::solve(
         << ", R=" << R
         << ", " << num_z_levels << " Z levels"
         << ", " << total_blocks << " total blocks"
-        << ", per_block_timeout=" << std::fixed << std::setprecision(1)
-        << m_per_block_timeout << "s"
+        << ", budget=" << std::fixed << std::setprecision(1) << m_timeout_sec << "s"
+        << " (redivided per block; " << m_per_block_timeout << "s if spread evenly)"
         << ", cpsat_workers=" << m_cpsat_workers
         << ", max_layer=" << max_edge_layer;
 
-    // CP-SAT refinement (Refined mode only)
-    // Single XY pass per Z level with overlapping blocks (R_OVERLAP cells).
-    // Blocks solved sequentially — CP-SAT uses all cores per block.
-    if (m_mode == MagmaTubeSolverMode::Refined) {
-        int blocks_completed = 0;
-        if (progress_fn) progress_fn(0, total_blocks);
-        for (int z_off = 0; z_off <= max_edge_layer; z_off += z_stride) {
-            solve_pass(0, 0, z_off,
-                [&](int) {
-                    ++blocks_completed;
-                    if (progress_fn) progress_fn(blocks_completed, total_blocks);
-                    if (throw_if_canceled) throw_if_canceled();
-                });
-        }
+    // One XY pass per Z level over overlapping blocks, solved sequentially with CP-SAT using
+    // all cores within each. Both modes run it; the mode only decides whether the stagger
+    // term is in the objective.
+    {
+        int work_done = 0;
+        auto step = [&](int) {
+            ++work_done;
+            if (progress_fn) progress_fn(work_done, total_blocks);
+            if (throw_if_canceled) throw_if_canceled();
+        };
 
-        validate_committed(m_edges, m_edge_index, m_committed, m_cells,
-                           m_um, m_layer_data, m_min_h_mm, m_max_h_mm,
-                           m_num_layers, "CPSAT");
+        if (progress_fn) progress_fn(0, total_blocks);
+        for (const std::vector<Block> &level : z_levels)
+            solve_pass(level, step);
+
+        validate_and_report("CPSAT");
     }
 
     extract_results(out_pairs, out_cell_pair_index);
@@ -146,7 +167,7 @@ void MagmaTubeSolver::solve(
     auto t_end = std::chrono::high_resolution_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
     BOOST_LOG_TRIVIAL(info) << "MagmaTubeSolver: "
-        << (m_mode == MagmaTubeSolverMode::Refined ? "refined" : "basic")
+        << (m_mode == MagmaTubeSolverMode::CoverageStagger ? "coverage+stagger" : "coverage")
         << " in " << ms << "ms, " << out_pairs.size() << " pairs placed";
 }
 
@@ -160,16 +181,19 @@ void MagmaTubeSolver::build_micron_tables()
     m_um.top_um.resize(n);
     m_um.bottom_um.resize(n);
 
-    for (int L = 0; L < n; ++L)
+    // Only rows from m_first_layer up are real; placeholder rows would all map Z=0 in the
+    // reverse maps below.
+    for (int L = m_first_layer; L < n; ++L)
         m_um.top_um[L] = llround(m_layer_data[L].print_z * 1000.0);
 
-    // Layer 0 bottom from actual bottom_z; subsequent layers contiguous by construction
-    m_um.bottom_um[0] = llround(m_layer_data[0].bottom_z() * 1000.0);
-    for (int L = 1; L < n; ++L)
+    // The first real layer's bottom is its own bottom_z (the raft top, with a raft).
+    if (m_first_layer < n)
+        m_um.bottom_um[m_first_layer] = llround(m_layer_data[m_first_layer].bottom_z() * 1000.0);
+    for (int L = m_first_layer + 1; L < n; ++L)
         m_um.bottom_um[L] = m_um.top_um[L - 1];
 
     // Reverse maps (same integers — guaranteed to match)
-    for (int L = 0; L < n; ++L) {
+    for (int L = m_first_layer; L < n; ++L) {
         m_um.bottom_to_layer[m_um.bottom_um[L]] = L;
         m_um.top_to_layer[m_um.top_um[L]] = L;
     }
@@ -186,7 +210,7 @@ void MagmaTubeSolver::build_edges()
     std::unordered_set<CellEdge, CellEdgeHash> seen;
 
     for (const auto &[cell, presence] : m_cells) {
-        for (const TriangleCell &nbr : cell.neighbors()) {
+        for (const CellId &nbr : m_lattice.neighbors(cell)) {
             if (m_cells.find(nbr) == m_cells.end())
                 continue;
             CellEdge edge(cell, nbr);
@@ -224,11 +248,8 @@ void MagmaTubeSolver::build_edges()
             }
             flush_run();
 
-            if (!ed.runs.empty()) {
-                size_t idx = m_edges.size();
-                m_edge_index[edge] = idx;
+            if (!ed.runs.empty())
                 m_edges.push_back(std::move(ed));
-            }
         }
     }
 
@@ -248,8 +269,7 @@ void MagmaTubeSolver::build_edges()
 // build_blocks
 // ============================================================================
 
-void MagmaTubeSolver::build_blocks(int off_a, int off_b, int off_z,
-                                    std::vector<Block> &out) const
+void MagmaTubeSolver::build_blocks(int off_z, std::vector<Block> &out) const
 {
     out.clear();
 
@@ -270,34 +290,63 @@ void MagmaTubeSolver::build_blocks(int off_a, int off_b, int off_z,
 
     auto floor_div = [](int a, int s) { return (a >= 0) ? a / s : (a - s + 1) / s; };
 
-    std::unordered_map<XYKey, std::vector<TriangleCell>, XYKeyHash> xy_groups;
+    // Anchor the grid on the part's minimum cell, not the lattice origin, so blocking is
+    // invariant under moving the object and a part up to R cells across is one block.
+    int min_a = std::numeric_limits<int>::max();
+    int min_b = std::numeric_limits<int>::max();
     for (const auto &[cell, _] : m_cells) {
-        int sa = cell.a + off_a;
-        int sb = cell.b + off_b;
-        int bx = floor_div(sa, stride);
-        int by = floor_div(sb, stride);
-        // Primary block
-        xy_groups[{bx, by}].push_back(cell);
-        // Overlap: if within R_OVERLAP of the next block boundary, also add to neighbor blocks
-        bool overlap_a = (sa - bx * stride) < R_OVERLAP && bx > floor_div(sa - 1, stride);
-        bool overlap_b = (sb - by * stride) < R_OVERLAP && by > floor_div(sb - 1, stride);
-        if (overlap_a)              xy_groups[{bx - 1, by}].push_back(cell);
-        if (overlap_b)              xy_groups[{bx, by - 1}].push_back(cell);
-        if (overlap_a && overlap_b) xy_groups[{bx - 1, by - 1}].push_back(cell);
+        min_a = std::min(min_a, cell.a);
+        min_b = std::min(min_b, cell.b);
+    }
+
+    std::unordered_map<XYKey, std::vector<CellId>, XYKeyHash> xy_groups;
+    for (const auto &[cell, _] : m_cells) {
+        const int sa = cell.a - min_a;
+        const int sb = cell.b - min_b;
+        xy_groups[{floor_div(sa, stride), floor_div(sb, stride)}].push_back(cell);
+    }
+
+    // Overlap, in a second pass so it only widens blocks that already hold cells of their own.
+    // A block made only of a neighbour's margin would be a subset of that neighbour, and
+    // re-solving it could only repeat or undo the neighbour's work.
+    for (const auto &[cell, _] : m_cells) {
+        const int sa = cell.a - min_a, sb = cell.b - min_b;
+        const int bx = floor_div(sa, stride), by = floor_div(sb, stride);
+        // Block bx-1 spans [(bx-1)*stride, (bx-1)*stride + R) = up to bx*stride + R_OVERLAP,
+        // so a cell also belongs to bx-1 exactly when its residual is below R_OVERLAP.
+        const bool overlap_a = (sa - bx * stride) < R_OVERLAP;
+        const bool overlap_b = (sb - by * stride) < R_OVERLAP;
+        auto extend = [&](XYKey k) {
+            auto it = xy_groups.find(k);
+            if (it != xy_groups.end()) it->second.push_back(cell);
+        };
+        if (overlap_a)              extend({bx - 1, by});
+        if (overlap_b)              extend({bx, by - 1});
+        if (overlap_a && overlap_b) extend({bx - 1, by - 1});
     }
 
     // Single Z slice: off_z to off_z + z_window - 1
     // (Z levels are iterated by the caller in solve())
-    int z_start = std::max(0, off_z);
+    int z_start = std::max(m_first_layer, off_z);   // never descend into placeholder rows
     int z_end   = std::min(off_z + m_z_window - 1, m_num_layers - 1);
     if (z_start >= m_num_layers || z_start > z_end) return;
 
     int64_t z_start_um = m_um.bottom_um[z_start];
     int64_t z_end_um   = m_um.top_um[z_end];
 
+    // Deterministic order, low corner first: each block is solved against what its
+    // predecessors committed, so order affects the result.
+    std::vector<XYKey> keys;
+    keys.reserve(xy_groups.size());
+    for (const auto &[k, _] : xy_groups) keys.push_back(k);
+    std::sort(keys.begin(), keys.end(), [](const XYKey &l, const XYKey &r) {
+        return l.by != r.by ? l.by < r.by : l.bx < r.bx;
+    });
+
     // Build blocks: one per XY group at this Z slice
-    for (const auto &[xy_key, cells] : xy_groups) {
-        std::unordered_set<TriangleCell, TriangleCellHash> cell_set(cells.begin(), cells.end());
+    for (const XYKey &xy_key : keys) {
+        const std::vector<CellId> &cells = xy_groups.at(xy_key);
+        std::unordered_set<CellId, CellIdHash> cell_set(cells.begin(), cells.end());
 
         Block block;
         block.cells = cell_set;
@@ -308,7 +357,7 @@ void MagmaTubeSolver::build_blocks(int off_a, int off_b, int off_z,
 
         // Collect edges via cell reverse lookup (avoids scanning all edges)
         std::unordered_set<size_t> seen_edges;
-        for (const TriangleCell &cell : cells) {
+        for (const CellId &cell : cells) {
             auto it = m_cell_edges.find(cell);
             if (it == m_cell_edges.end()) continue;
             for (size_t ei : it->second) {
@@ -329,13 +378,244 @@ void MagmaTubeSolver::build_blocks(int off_a, int off_b, int off_z,
             }
         }
 
-        if (!block.edge_indices.empty())
-            out.push_back(std::move(block));
+        if (block.edge_indices.empty()) continue;
+        // Edge order is variable order in the model, which affects CP-SAT's search.
+        std::sort(block.edge_indices.begin(), block.edge_indices.end());
+        out.push_back(std::move(block));
     }
 
-    BOOST_LOG_TRIVIAL(debug) << "MagmaTubeSolver: pass offset(" << off_a << ","
-        << off_b << "," << off_z << ") -> " << out.size() << " blocks";
+    BOOST_LOG_TRIVIAL(debug) << "MagmaTubeSolver: Z level " << off_z
+        << " -> " << out.size() << " blocks";
 }
+
+// ============================================================================
+// SegVars — one candidate tube slot in the CP-SAT model
+// ============================================================================
+
+struct SegVars {
+    ortsat::BoolVar     active;
+    ortsat::IntVar      start;
+    ortsat::IntVar      end;
+    ortsat::IntVar      size;
+    size_t      edge_idx;
+    int64_t     run_start_um;  // which run this slot belongs to
+    int64_t     run_end_um;
+    int         slot_idx;      // k within the run (0-based)
+    operations_research::Domain contrib_dom; // {0} u feasible sizes
+};
+
+namespace {
+
+// Distance in microns beyond which two tube boundaries no longer count as close. A modelling
+// bound, not a setting: it only sets where the "closer is worse" penalty reaches zero.
+//
+// Must be at most half the minimum tube height. Two neighbouring columns with boundaries
+// spaced s apart and offset by d give each boundary partners at d and s-d; if a horizon h
+// reaches both, their penalties sum to 2h-s regardless of d, and the objective goes flat.
+// Since s >= min_h, h = min_h/2 keeps only the nearer partner in range.
+inline int64_t stagger_horizon_um(int64_t min_h_um) { return min_h_um / 2; }
+
+// Where slot k's boundaries can land. Activation is a prefix (see the symmetry breaking in
+// solve_block), so an active slot k has k tubes of at least min_h below it in the run.
+// There is no tighter upper bound than the run end: slots above k need not be active, and
+// excluding a legal position here makes the model infeasible.
+struct SlotRange { int64_t lo, hi; };
+
+SlotRange boundary_range(const SegVars &sv, bool is_end, int64_t min_h_um)
+{
+    const int64_t below = int64_t(sv.slot_idx) + (is_end ? 1 : 0);
+    int64_t lo = sv.run_start_um + below * min_h_um;
+    const int64_t hi = sv.run_end_um;
+    if (lo > hi) lo = sv.run_start_um;
+    return {lo, hi};
+}
+
+// How close to optimal the stagger term must be proven before the solver may stop, in
+// fully-coincident boundary pairs. W_COVERAGE is inflated by the same amount, so raising it
+// trades stagger quality for solve time without ever costing coverage.
+constexpr int64_t STAGGER_GAP_PAIRS = 1;
+
+// Crowding levels scored per window. J levels reproduce C(N,2) exactly up to N = J+1 and grow
+// linearly above it, which is still monotone.
+constexpr int STAGGER_HINGE_LEVELS = 4;
+
+// Stagger penalty: slide a horizon-tall window up the layer grid and charge crowding.
+//
+// Equivalent to the per-pair tent max(0, horizon - |b1 - b2|): measured in grid steps, two
+// boundaries d apart share (horizon - d) windows, so
+//
+//     sum over windows of C(N, 2)  ==  sum over pairs of max(0, horizon - d)
+//
+// and C(N,2) = sum over j>=1 of max(0, N - j), each hinge one variable and one linear row.
+// Counting with convex hinges relaxes far better than the concave |b1 - b2|, on which the
+// solver has to branch for every pair.
+//
+// The windows overlap, one per grid position; edge-to-edge tiling would let two boundaries a
+// layer apart straddle a seam and score nothing. Frozen boundaries just add a constant to a
+// position's count.
+ortsat::LinearExpr build_stagger_penalty(
+    ortsat::CpModelBuilder                                                       &model,
+    const Block                                                          &block,
+    const std::vector<SegVars>                                           &segs,
+    const std::vector<EdgeData>                                          &edges,
+    const std::unordered_map<CellId, std::vector<size_t>, CellIdHash>    &cell_edges,
+    const std::unordered_map<size_t, std::vector<int64_t>>              &frozen_boundaries,
+    const MagmaLattice                                                   &lattice,
+    const MicronTables                                                   &um,
+    int64_t horizon_um, int64_t min_h_um,
+    int &out_windows, int &out_terms, int64_t &out_penalty_ub, int64_t &out_pair_cost)
+{
+    ortsat::LinearExpr penalty;
+    out_windows = out_terms = 0;
+    out_penalty_ub = out_pair_cost = 0;
+
+    // ---- the layer grid for this block ----
+    std::vector<int64_t> grid;
+    grid.push_back(um.bottom_um[block.z_start_layer]);
+    for (int L = block.z_start_layer; L <= block.z_end_layer; ++L)
+        grid.push_back(um.top_um[L]);
+    const int G = int(grid.size());
+    if (G < 2)
+        return penalty;
+
+    std::unordered_map<int64_t, int> grid_index;
+    for (int i = 0; i < G; ++i)
+        grid_index[grid[i]] = i;
+
+    // Window [i, win_end[i]) spans as close to horizon_um as the real layer heights allow, so
+    // variable layer height is handled exactly rather than assumed away.
+    std::vector<int> win_end(G);
+    for (int i = 0, j = 0; i < G; ++i) {
+        if (j < i) j = i;
+        while (j < G && grid[j] - grid[i] < horizon_um) ++j;
+        win_end[i] = j;
+    }
+
+    // Cost of one fully-coincident pair: it is charged once per window spanning its position,
+    // so the widest window in grid steps. Measured in steps, not microns, so it stays correct
+    // under variable layer height. Used to size the objective's gap allowance.
+    for (int i = 0; i < G; ++i)
+        out_pair_cost = std::max<int64_t>(out_pair_cost, win_end[i] - i);
+
+    // ---- one-hot channelling: which grid position each boundary occupies ----
+    // Sum(pos) == active, so an inactive tube contributes nothing to any count and no
+    // enforcement literal is needed anywhere in the penalty path below.
+    struct Flags { int lo, hi; std::vector<ortsat::BoolVar> pos; };   // grid range [lo, hi)
+    std::vector<std::array<Flags, 2>> flags(segs.size());             // [slot][0=start,1=end]
+
+    for (size_t si = 0; si < segs.size(); ++si) {
+        for (int w = 0; w < 2; ++w) {
+            const SlotRange r = boundary_range(segs[si], w == 1, min_h_um);
+            int lo = G, hi = 0;
+            for (int i = 0; i < G; ++i) {
+                if (grid[i] < r.lo || grid[i] > r.hi) continue;
+                lo = std::min(lo, i);
+                hi = std::max(hi, i + 1);
+            }
+            if (lo >= hi) { flags[si][w].lo = flags[si][w].hi = 0; continue; }
+
+            Flags &f = flags[si][w];
+            f.lo = lo; f.hi = hi;
+            f.pos.reserve(hi - lo);
+            ortsat::LinearExpr sum, weighted;
+            for (int i = lo; i < hi; ++i) {
+                ortsat::BoolVar b = model.NewBoolVar();
+                f.pos.push_back(b);
+                sum      += b;
+                weighted += ortsat::LinearExpr::Term(b, grid[i]);
+            }
+            model.AddEquality(sum, segs[si].active);
+            model.AddEquality(w == 1 ? segs[si].end : segs[si].start, weighted)
+                 .OnlyEnforceIf(segs[si].active);
+        }
+    }
+
+    // ---- per cell: who feeds this cell's counter ----
+    // Its own tubes and its neighbours'. A cell's own abutment seams are counted too; the
+    // tube-count term already prices them.
+    for (const CellId &cell : block.cells) {
+        std::unordered_set<size_t> nbhd_edges;
+        auto add_edges = [&](const CellId &c) {
+            auto it = cell_edges.find(c);
+            if (it == cell_edges.end()) return;
+            for (size_t ei : it->second) nbhd_edges.insert(ei);
+        };
+        add_edges(cell);
+        for (const CellId &nbr : lattice.neighbors(cell))
+            add_edges(nbr);
+
+        // Arrivals per grid position: decision boundaries as literals, frozen ones as counts.
+        std::vector<ortsat::LinearExpr> arrivals(G);
+        std::vector<int>                arrival_ub(G, 0);
+        bool any = false;
+
+        for (size_t si = 0; si < segs.size(); ++si) {
+            if (!nbhd_edges.count(segs[si].edge_idx)) continue;
+            for (int w = 0; w < 2; ++w) {
+                const Flags &f = flags[si][w];
+                for (int i = f.lo; i < f.hi; ++i) {
+                    arrivals[i] += f.pos[i - f.lo];
+                    ++arrival_ub[i];
+                    any = true;
+                }
+            }
+        }
+        // Frozen boundaries over the same edge set, so each counts once, whichever cell holds it.
+        for (size_t ei : nbhd_edges) {
+            auto it = frozen_boundaries.find(ei);
+            if (it == frozen_boundaries.end()) continue;
+            for (int64_t z : it->second) {
+                auto g = grid_index.find(z);
+                if (g == grid_index.end()) continue;
+                arrivals[g->second] += 1;
+                ++arrival_ub[g->second];
+                any = true;
+            }
+        }
+
+        if (!any) continue;
+
+        // Prefix sums, so a window count is one subtraction rather than a sum over its width.
+        int total_ub = 0;
+        for (int i = 0; i < G; ++i) total_ub += arrival_ub[i];
+
+        std::vector<ortsat::IntVar> prefix(G);
+        ortsat::LinearExpr running;
+        for (int i = 0; i < G; ++i) {
+            prefix[i] = model.NewIntVar(operations_research::Domain(0, total_ub));
+            running += arrivals[i];
+            model.AddEquality(prefix[i], running);
+        }
+
+        // One window per grid position, hinge-stacked.
+        for (int i = 0; i < G; ++i) {
+            const int j = win_end[i];
+            if (j <= i + 1) continue;                 // a window holding one position cannot crowd
+
+            int win_ub = 0;
+            for (int k = i; k < j; ++k) win_ub += arrival_ub[k];
+            if (win_ub < 2) continue;                 // nothing here could ever collide
+
+            // count = prefix[j-1] - prefix[i-1]
+            ortsat::LinearExpr count = prefix[j - 1];
+            if (i > 0) count -= prefix[i - 1];
+
+            ++out_windows;
+            for (int lvl = 1; lvl <= STAGGER_HINGE_LEVELS && lvl < win_ub; ++lvl) {
+                const int64_t ub = win_ub - lvl;
+                ortsat::IntVar pen = model.NewIntVar(operations_research::Domain(0, ub));
+                model.AddGreaterOrEqual(pen, count - lvl);
+                penalty += pen;
+                out_penalty_ub += ub;
+                ++out_terms;
+            }
+        }
+    }
+
+    return penalty;
+}
+
+} // namespace
 
 // ============================================================================
 // solve_block — build and solve CP-SAT model for one block
@@ -347,27 +627,18 @@ BlockResult MagmaTubeSolver::solve_block(const Block &block) const
 
     const int64_t min_h_um = llround(m_min_h_mm * 1000.0);
     const int64_t max_h_um = llround(m_max_h_mm * 1000.0);
-    // Dodge zone from config (0 = stagger disabled)
-    const int64_t dodge_um = llround(m_dodge_mm * 1000.0);
+    const int64_t horizon_um = stagger_horizon_um(min_h_um);
 
     CpModelBuilder model;
 
     // Track intervals per cell for NoOverlap
-    std::unordered_map<TriangleCell, std::vector<IntervalVar>, TriangleCellHash> cell_intervals;
+    std::unordered_map<CellId, std::vector<IntervalVar>, CellIdHash> cell_intervals;
+    // Per-cell committed coverage, accumulated only over runs this model actually represents.
+    std::unordered_map<CellId, int64_t, CellIdHash> cell_floor;
 
-    // Track segment variables for objective and result extraction
-    struct SegVars {
-        BoolVar     active;
-        IntVar      start;
-        IntVar      end;
-        IntVar      size;
-        IntervalVar interval;
-        size_t      edge_idx;
-        int64_t     run_start_um;  // which run this slot belongs to
-        int64_t     run_end_um;
-        operations_research::Domain contrib_dom; // {0} ∪ feasible sizes
-    };
     std::vector<SegVars> all_segments;
+    // Summed per run below; becomes a hard cap on coverage_expr once the model is built.
+    int64_t coverage_ceiling_um = 0;
 
     // ------------------------------------------------------------------
     // 1. Create decision variables for each edge's runs
@@ -398,16 +669,11 @@ BlockResult MagmaTubeSolver::solve_block(const Block &block) const
             if (eff_h < min_h_um)
                 continue; // Clipped range too short for a tube
 
-            // K = greedy tube count in this run × 1.3 + 1.
-            // Gives 30% headroom for stagger splits beyond greedy's placement.
-            // No cap — bounded by geometry (run height / min tube height).
-            int64_t run_start_um = m_um.bottom_um[eff_start];
-            int64_t run_end_um   = m_um.top_um[eff_end];
-            int K_from_greedy = 0;
-            for (const CommittedSegment &seg : m_committed[ei])
-                if (seg.start_um >= run_start_um && seg.end_um <= run_end_um)
-                    ++K_from_greedy;
-            int K = std::max(2, K_from_greedy * 13 / 10 + 1);
+            const int64_t run_start_um = m_um.bottom_um[eff_start];
+            const int64_t run_end_um   = m_um.top_um[eff_end];
+
+            // Slot count: how many tubes fit in the run, independent of what is committed.
+            const int K = std::max<int>(2, int((run_end_um - run_start_um) / min_h_um));
 
             // Unified layer boundary list for this run
             std::vector<int64_t> boundaries;
@@ -429,6 +695,26 @@ BlockResult MagmaTubeSolver::solve_block(const Block &block) const
 
             if (size_set.empty())
                 continue; // No valid tube height for this run
+
+            // The per-cell coverage floor counts only committed segments inside a modelled
+            // run: anything else has no variable to satisfy it and would make the block
+            // infeasible.
+            for (const CommittedSegment &cs : m_committed[ei])
+                if (cs.start_um >= run_start_um && cs.end_um <= run_end_um) {
+                    const int64_t h = cs.end_um - cs.start_um;
+                    cell_floor[ed.edge.a] += h;
+                    cell_floor[ed.edge.b] += h;
+                }
+
+            // Upper bound on this run's coverage: at most L/min_size disjoint tubes of at most
+            // max_size each, capped by L. Tighter than L when no tube count tiles the run
+            // (e.g. min_h 2.0, max_h 3.4, L 3.7). Never excludes a legal solution.
+            {
+                const int64_t L        = run_end_um - run_start_um;
+                const int64_t min_size = *size_set.begin();
+                const int64_t max_size = *size_set.rbegin();
+                coverage_ceiling_um += std::min(L, (L / min_size) * max_size);
+            }
 
             std::vector<int64_t> size_vals(size_set.begin(), size_set.end());
             std::vector<int64_t> contrib_vals = {0};
@@ -462,15 +748,18 @@ BlockResult MagmaTubeSolver::solve_block(const Block &block) const
                 if (has_prev) {
                     // Segment k can only be active if k-1 is active
                     model.AddImplication(active, prev_active);
-                    // When both active, k must come after k-1 (gap of at least 1 um)
-                    model.AddLessThan(all_segments.back().end, start)
+                    // When both active, k starts at or after k-1's end. Must stay
+                    // non-strict: positions are layer boundaries, so strict
+                    // less-than would force a layer-high gap between abutting
+                    // tubes and reject greedy's hint, which abuts them.
+                    model.AddLessOrEqual(all_segments.back().end, start)
                         .OnlyEnforceIf({prev_active, active});
                 }
 
                 int64_t rs = boundaries.front();
                 int64_t re = boundaries.back();
-                all_segments.push_back({active, start, end, size, interval,
-                                        ei, rs, re, contrib_dom});
+                all_segments.push_back({active, start, end, size,
+                                        ei, rs, re, k, contrib_dom});
                 prev_active = active;
                 has_prev = true;
             }
@@ -482,11 +771,12 @@ BlockResult MagmaTubeSolver::solve_block(const Block &block) const
     // ------------------------------------------------------------------
 
     // Frozen boundaries for stagger penalty
-    std::unordered_map<TriangleCell, std::vector<int64_t>, TriangleCellHash> frozen_boundaries;
+    // Keyed by edge, so the stagger penalty can count each boundary once per neighbourhood.
+    std::unordered_map<size_t, std::vector<int64_t>> frozen_boundaries;
 
     // Scan boundary edges via cell reverse lookup (avoids scanning all edges)
     std::unordered_set<size_t> seen_boundary_edges;
-    for (const TriangleCell &cell : block.cells) {
+    for (const CellId &cell : block.cells) {
         auto it = m_cell_edges.find(cell);
         if (it == m_cell_edges.end()) continue;
         for (size_t ei : it->second) {
@@ -499,7 +789,7 @@ BlockResult MagmaTubeSolver::solve_block(const Block &block) const
             if (a_in == b_in)
                 continue;
 
-            const TriangleCell &inside_cell = a_in ? ed.edge.a : ed.edge.b;
+            const CellId &inside_cell = a_in ? ed.edge.a : ed.edge.b;
 
             for (const CommittedSegment &seg : m_committed[ei]) {
                 // Clip to block Z range
@@ -513,15 +803,14 @@ BlockResult MagmaTubeSolver::solve_block(const Block &block) const
                 cell_intervals[inside_cell].push_back(frozen);
 
                 // Record boundaries for stagger (use actual, not clipped)
-                frozen_boundaries[inside_cell].push_back(seg.start_um);
-                frozen_boundaries[inside_cell].push_back(seg.end_um);
+                frozen_boundaries[ei].push_back(seg.start_um);
+                frozen_boundaries[ei].push_back(seg.end_um);
             }
         }
     }
 
-    // Decision-edge segments that extend outside the block's Z range are frozen
-    // (the block can't fully see them). Segments fully inside Z range become
-    // warm start hints — the solver re-optimizes them.
+    // Decision-edge segments that extend outside the block's Z range are frozen; those fully
+    // inside become warm-start hints and are re-optimized.
     for (size_t ei : block.edge_indices) {
         for (const CommittedSegment &seg : m_committed[ei]) {
             if (seg.start_um >= block.z_start_um && seg.end_um <= block.z_end_um)
@@ -538,16 +827,14 @@ BlockResult MagmaTubeSolver::solve_block(const Block &block) const
             cell_intervals[ed.edge.a].push_back(frozen);
             cell_intervals[ed.edge.b].push_back(frozen);
 
-            frozen_boundaries[ed.edge.a].push_back(seg.start_um);
-            frozen_boundaries[ed.edge.a].push_back(seg.end_um);
-            frozen_boundaries[ed.edge.b].push_back(seg.start_um);
-            frozen_boundaries[ed.edge.b].push_back(seg.end_um);
+            frozen_boundaries[ei].push_back(seg.start_um);
+            frozen_boundaries[ei].push_back(seg.end_um);
         }
     }
 
-    // Early out: no decision variables means nothing to solve
+    // No decision variables (e.g. every run clipped too short by the Z range): nothing to solve.
     if (all_segments.empty())
-        return BlockResult{};
+        return BlockResult{BlockOutcome::NoWork, {}};
 
     // ------------------------------------------------------------------
     // 3. NoOverlap per cell
@@ -558,186 +845,90 @@ BlockResult MagmaTubeSolver::solve_block(const Block &block) const
     }
 
     // ------------------------------------------------------------------
-    // 4. Objective: three-tier lexicographic via weighted sum
+    // 4. Contribution variables
     //
-    //   Tier 1 — Coverage (fill): maximize total tube µm
-    //   Tier 2 — Tube length:     prefer fewer, longer tubes
-    //   Tier 3 — Stagger:         spread tube boundaries apart
-    //
-    // Each tier's minimum contribution exceeds the next tier's maximum
-    // total, so higher tiers always dominate.  This prevents the solver
-    // from splitting a long tube into short ones for stagger benefit.
-    //
-    // Overflow budget:  max objective ≈ 5×10¹³, int64_max ≈ 9.2×10¹⁸
-    //                   (184,000× headroom)
+    // A slot's contribution is its size when active and 0 when not. The objective maximises
+    // their sum and pays for active_expr; the per-cell floors below constrain their sums per
+    // cell.
     // ------------------------------------------------------------------
 
-    // Tier 1: coverage — 1µm of fill outweighs all activation + stagger.
-    constexpr int64_t W_COVERAGE = 1000000;
-
-    // Tier 2: activation cost — fixed penalty per active tube segment.
-    // A linear length bonus (W*size) can't prevent splitting because
-    // W*S == W*(S/2) + W*(S/2).  The activation cost makes 1 long tube
-    // strictly cheaper than 2 short tubes with the same total coverage.
-    // Must exceed max stagger benefit of one split (~36).
-    constexpr int64_t W_ACTIVATION = 100;
-
-    // Tier 3: stagger — tiebreaker among equal-coverage, equal-count solutions.
-    // (W_STAGGER_TIGHT and W_STAGGER_WIDE defined below, values 2 and 1)
-
-    LinearExpr objective;
+    LinearExpr coverage_expr;  // Σ contrib, in µm
+    LinearExpr active_expr;    // Σ active
+    std::vector<IntVar> seg_contrib;
+    seg_contrib.reserve(all_segments.size());
 
     for (const auto &seg : all_segments) {
-        // Coverage: W_COVERAGE * size when active, 0 when not
         IntVar contrib = model.NewIntVar(seg.contrib_dom);
         model.AddEquality(contrib, seg.size).OnlyEnforceIf(seg.active);
         model.AddEquality(contrib, 0).OnlyEnforceIf(seg.active.Not());
-        objective += W_COVERAGE * contrib;
-
-        // Activation cost: penalize each active segment to prefer fewer tubes
-        objective -= W_ACTIVATION * seg.active;
+        coverage_expr += contrib;
+        active_expr   += seg.active;
+        seg_contrib.push_back(contrib);
     }
 
-    // Stagger: per-cell cumulative penalty (skipped when dodge_um == 0).
+    // ------------------------------------------------------------------
+    // 4b. Per-cell coverage floors
+    // ------------------------------------------------------------------
     //
-    // For each cell C, create two cumulative constraints (tight + wide scale)
-    // covering boundaries from C's Ring-0 edges (demand=2) and Ring-1
-    // neighbor edges (demand=1). Each boundary creates an exclusion zone
-    // interval centered on its position. The cumulative capacity variable
-    // measures peak boundary concentration — the solver minimizes it.
+    // A cell's committed coverage is a floor the solve cannot go below. The objective weight
+    // only guarantees coverage for a solve that reaches optimality; the floor also holds when
+    // a block hits its time limit. Per cell, because an aggregate floor would allow emptying
+    // one cell to over-fill its neighbour.
+    {
+        std::unordered_map<CellId, ortsat::LinearExpr, CellIdHash> cell_cov;
+        for (size_t si = 0; si < all_segments.size(); ++si) {
+            const CellEdge &e = m_edges[all_segments[si].edge_idx].edge;
+            cell_cov[e.a] += seg_contrib[si];
+            cell_cov[e.b] += seg_contrib[si];
+        }
+        for (const auto &cf : cell_floor) {
+            auto it = cell_cov.find(cf.first);
+            if (it != cell_cov.end() && cf.second > 0)
+                model.AddGreaterOrEqual(it->second, cf.second);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 4c. Objective: coverage first, then tube count + stagger penalty
+    // ------------------------------------------------------------------
     //
-    // Two scales provide graduated penalty: very close boundaries trigger
-    // both tight and wide penalties, moderately close only trigger wide.
+    // A single solve, so stagger chooses among the coverage-optimal solutions rather than
+    // inheriting an arbitrary one. Coverage is in integer microns, and its weight exceeds the
+    // largest possible sum of the secondary terms (slot count + stagger_ub), so one micron of
+    // fill outscores any secondary trade. Tube count and stagger share the secondary tier at
+    // equal unit weight.
+    int     stagger_windows = 0, stagger_terms = 0;
+    int64_t stagger_ub = 0, stagger_pair_cost = 0;
+    LinearExpr stagger;
 
-    constexpr int64_t W_STAGGER_TIGHT = 2;
-    constexpr int64_t W_STAGGER_WIDE  = 1;
+    if (m_mode == MagmaTubeSolverMode::CoverageStagger && horizon_um > 0)
+        stagger = build_stagger_penalty(
+            model, block, all_segments, m_edges, m_cell_edges, frozen_boundaries,
+            m_lattice, m_um, horizon_um, min_h_um,
+            stagger_windows, stagger_terms, stagger_ub, stagger_pair_cost);
 
-    if (dodge_um > 0) {
+    // Redundant cuts linking coverage to tube count, which the LP relaxation cannot derive
+    // cheaply from the per-segment relations; they shorten the optimality proof.
+    model.AddGreaterOrEqual(coverage_expr, min_h_um * active_expr);
+    model.AddLessOrEqual(coverage_expr, max_h_um * active_expr);
 
-    const int64_t wide_zone_um  = dodge_um;
-    const int64_t tight_zone_um = std::max<int64_t>(1, dodge_um / 2);
+    // Constant ceiling on coverage. The relaxation escapes the cuts above by raising
+    // fractional activity (NoOverlap gives no linear cut), so without this the dual bound
+    // overstates coverage and the gap never closes to stagger size.
+    if (coverage_ceiling_um > 0)
+        model.AddLessOrEqual(coverage_expr, coverage_ceiling_um);
 
-    std::unordered_set<size_t> block_edge_set(block.edge_indices.begin(),
-                                               block.edge_indices.end());
+    // W is also inflated by the absolute gap limit set below, so a micron of coverage is worth
+    // more than the gap and stopping early can never cost coverage; the secondary terms land
+    // within STAGGER_GAP_PAIRS coincident pairs of optimal. stagger_ub is the exact sum of the
+    // hinge variables' upper bounds.
+    const int64_t secondary_max = int64_t(all_segments.size()) + stagger_ub;
+    const int64_t stagger_gap   = stagger_terms > 0 ? STAGGER_GAP_PAIRS * stagger_pair_cost : 0;
+    const int64_t W_COVERAGE    = secondary_max + stagger_gap + 1;
 
-    // Build edge → segment indices index
-    std::unordered_map<size_t, std::vector<size_t>> edge_to_segs;
-    for (size_t si = 0; si < all_segments.size(); ++si)
-        edge_to_segs[all_segments[si].edge_idx].push_back(si);
-
-    // Pre-create zone intervals for each segment boundary (reused across
-    // multiple cells' cumulatives — same IntervalVar, different demands)
-    struct BoundaryZones {
-        IntervalVar tight_start, tight_end;
-        IntervalVar wide_start, wide_end;
-    };
-    std::vector<BoundaryZones> seg_zones(all_segments.size());
-    for (size_t si = 0; si < all_segments.size(); ++si) {
-        const auto &seg = all_segments[si];
-        seg_zones[si].tight_start = model.NewOptionalFixedSizeIntervalVar(
-            seg.start - tight_zone_um / 2, tight_zone_um, seg.active);
-        seg_zones[si].tight_end = model.NewOptionalFixedSizeIntervalVar(
-            seg.end - tight_zone_um / 2, tight_zone_um, seg.active);
-        seg_zones[si].wide_start = model.NewOptionalFixedSizeIntervalVar(
-            seg.start - wide_zone_um / 2, wide_zone_um, seg.active);
-        seg_zones[si].wide_end = model.NewOptionalFixedSizeIntervalVar(
-            seg.end - wide_zone_um / 2, wide_zone_um, seg.active);
-    }
-
-    // Pre-create zone intervals for frozen boundaries (keyed by position
-    // to avoid duplicates, since the same frozen boundary may appear in
-    // multiple cells' maps)
-    struct FrozenZones {
-        IntervalVar tight, wide;
-    };
-    std::unordered_map<int64_t, FrozenZones> frozen_zone_cache;
-    auto get_frozen_zones = [&](int64_t pos) -> const FrozenZones & {
-        auto it = frozen_zone_cache.find(pos);
-        if (it != frozen_zone_cache.end())
-            return it->second;
-        FrozenZones fz;
-        fz.tight = model.NewFixedSizeIntervalVar(
-            pos - tight_zone_um / 2, tight_zone_um);
-        fz.wide = model.NewFixedSizeIntervalVar(
-            pos - wide_zone_um / 2, wide_zone_um);
-        return frozen_zone_cache.emplace(pos, fz).first->second;
-    };
-
-    // For each cell, build cumulative constraints over its Ring-1 neighborhood
-    for (const TriangleCell &cell : block.cells) {
-        // Collect segment indices with demand weight:
-        //   Ring-0 (cell's own edges): demand = 2
-        //   Ring-1 (neighbor edges):   demand = 1
-        struct SegDemand { size_t seg_idx; int demand; };
-        std::vector<SegDemand> seg_demands;
-        std::unordered_set<size_t> seen_edges;
-
-        auto add_edges_for_cell = [&](const TriangleCell &c, int demand) {
-            auto it = m_cell_edges.find(c);
-            if (it == m_cell_edges.end()) return;
-            for (size_t ei : it->second) {
-                if (!block_edge_set.count(ei)) continue;
-                if (!seen_edges.insert(ei).second) continue;
-                auto seg_it = edge_to_segs.find(ei);
-                if (seg_it == edge_to_segs.end()) continue;
-                for (size_t si : seg_it->second)
-                    seg_demands.push_back({si, demand});
-            }
-        };
-
-        // Ring-0: edges involving this cell
-        add_edges_for_cell(cell, 2);
-        // Ring-1: edges involving neighbor cells
-        for (const TriangleCell &nbr : cell.neighbors())
-            add_edges_for_cell(nbr, 1);
-
-        // Collect frozen boundaries: Ring-0 (demand=2) + Ring-1 (demand=1)
-        struct FrozenDemand { int64_t pos; int demand; };
-        std::vector<FrozenDemand> frozen_demands;
-        std::unordered_set<int64_t> seen_frozen;
-
-        auto add_frozen_for_cell = [&](const TriangleCell &c, int demand) {
-            auto it = frozen_boundaries.find(c);
-            if (it == frozen_boundaries.end()) return;
-            for (int64_t fb : it->second)
-                if (seen_frozen.insert(fb).second)
-                    frozen_demands.push_back({fb, demand});
-        };
-
-        add_frozen_for_cell(cell, 2);
-        // Ring-1: frozen boundaries from neighbor cells
-        for (const TriangleCell &nbr : cell.neighbors())
-            add_frozen_for_cell(nbr, 1);
-
-        // Skip cells with too few boundaries to have meaningful stagger
-        if (seg_demands.size() + frozen_demands.size() < 2)
-            continue;
-
-        // Build cumulative at each scale
-        auto build_cumulative = [&](bool tight, int64_t weight) {
-            // Capacity is purely soft — any value is feasible, higher = more
-            // penalty in the objective. Domain must never cause INFEASIBLE.
-            IntVar capacity = model.NewIntVar(
-                operations_research::Domain(0, 10000));
-            auto cum = model.AddCumulative(capacity);
-
-            for (const auto &sd : seg_demands) {
-                const auto &z = seg_zones[sd.seg_idx];
-                cum.AddDemand(tight ? z.tight_start : z.wide_start, sd.demand);
-                cum.AddDemand(tight ? z.tight_end   : z.wide_end,   sd.demand);
-            }
-            for (const auto &fd : frozen_demands) {
-                const auto &fz = get_frozen_zones(fd.pos);
-                cum.AddDemand(tight ? fz.tight : fz.wide, fd.demand);
-            }
-
-            objective -= weight * capacity;
-        };
-
-        build_cumulative(true,  W_STAGGER_TIGHT);
-        build_cumulative(false, W_STAGGER_WIDE);
-    }
-    } // if (dodge_um > 0)
+    LinearExpr objective = W_COVERAGE * coverage_expr - active_expr;
+    if (stagger_terms > 0)
+        objective -= stagger;
 
     model.Maximize(objective);
 
@@ -761,7 +952,8 @@ BlockResult MagmaTubeSolver::solve_block(const Block &block) const
                           return a->start_um < b->start_um;
                       });
 
-        // Match committed segments to the correct run's slot
+        // Match committed segments, in order, to the leading slots of the run containing
+        // them, which keeps hinted activation a prefix within each run.
         for (auto &[ei, hints] : edge_hints) {
             if (hints.empty()) continue;
             size_t ci = 0;
@@ -780,7 +972,8 @@ BlockResult MagmaTubeSolver::solve_block(const Block &block) const
             }
         }
 
-        // Hint remaining segments as inactive (completes the initial solution)
+        // Hint the remaining slots inactive. CP-SAT silently discards the whole hint if any
+        // part of it violates a hard constraint, so hints must stay feasible.
         for (size_t si = 0; si < all_segments.size(); ++si) {
             if (!hinted[si])
                 model.AddHint(all_segments[si].active, false);
@@ -793,13 +986,15 @@ BlockResult MagmaTubeSolver::solve_block(const Block &block) const
     SatParameters params;
     params.set_max_time_in_seconds(m_per_block_timeout);
     params.set_num_workers(m_cpsat_workers);
-    // NOTE: linearization_level and relative_gap_limit removed — defaults
-    // perform better with our discrete domains. gap_limit was causing
-    // medium blocks to stop early, losing 1-2 tubes per block.
-    // NOTE: repair_hint and hint_conflict_limit removed — triggered
-    // CP-SAT fixed_search crash (integer_search.cc:1217)
+    // Stop once no solution can be more than stagger_gap better; W_COVERAGE covers that
+    // allowance, so this never costs coverage. Must be absolute: a relative gap on a
+    // coverage-dominated objective would admit losing whole tubes.
+    if (stagger_gap > 0)
+        params.set_absolute_gap_limit(double(stagger_gap));
+    // Default linearization_level performs better with these discrete domains.
+    // Do not set repair_hint or hint_conflict_limit: they trigger a CP-SAT fixed_search
+    // crash (integer_search.cc:1217).
 
-    // Validate model before solving (catches structural bugs)
     auto proto = model.Build();
     std::string validation_error = ValidateCpModel(proto);
     if (!validation_error.empty()) {
@@ -810,9 +1005,8 @@ BlockResult MagmaTubeSolver::solve_block(const Block &block) const
     operations_research::sat::Model sat_model;
     sat_model.Add(NewSatParameters(params));
 
-    // Cancellation: checked between passes via check_canceled().
-    // Mid-solve abort not wired — TimeLimit::RegisterExternalBooleanAsLimit
-    // conflicts with NewSatParameters (creates TimeLimit without params).
+    // Cancellation is checked between blocks only. A mid-solve abort via
+    // TimeLimit::RegisterExternalBooleanAsLimit conflicts with NewSatParameters.
 
     CpSolverResponse response = SolveCpModel(proto, &sat_model);
 
@@ -822,7 +1016,7 @@ BlockResult MagmaTubeSolver::solve_block(const Block &block) const
     BlockResult result;
     if (response.status() == CpSolverStatus::OPTIMAL ||
         response.status() == CpSolverStatus::FEASIBLE) {
-        result.solved = true;
+        result.outcome = BlockOutcome::Solved;
         for (const auto &seg : all_segments) {
             if (SolutionBooleanValue(response, seg.active)) {
                 int64_t s = SolutionIntegerValue(response, seg.start);
@@ -834,46 +1028,44 @@ BlockResult MagmaTubeSolver::solve_block(const Block &block) const
         int64_t solver_cov = 0;
         for (const auto &[eidx, seg] : result.segments)
             solver_cov += seg.end_um - seg.start_um;
-        int64_t greedy_cov = 0;
+        int64_t committed_cov = 0;
         for (size_t ei : block.edge_indices)
             for (const CommittedSegment &cs : m_committed[ei])
                 if (cs.start_um >= block.z_start_um && cs.end_um <= block.z_end_um)
-                    greedy_cov += cs.end_um - cs.start_um;
+                    committed_cov += cs.end_um - cs.start_um;
+
+        // Diagnostic only: the objective is coverage-dominated, so this says little about stagger.
+        const double gap_pct =
+            (response.best_objective_bound() > 0)
+                ? (1.0 - response.objective_value() / response.best_objective_bound()) * 100.0
+                : 0.0;
 
         BOOST_LOG_TRIVIAL(debug) << "MagmaTubeSolver: block solved "
             << (response.status() == CpSolverStatus::OPTIMAL ? "OPTIMAL" : "FEASIBLE")
             << ", obj=" << response.objective_value()
-            << ", gap=" << (response.best_objective_bound() > 0
-                ? (1.0 - response.objective_value() / response.best_objective_bound()) * 100.0
-                : 0.0) << "%"
+            << ", gap=" << gap_pct << "%"
             << ", segs=" << result.segments.size()
             << "/" << all_segments.size()
             << ", wall=" << std::fixed << std::setprecision(2)
             << response.wall_time() << "s"
             << " | cov=" << solver_cov/1000.0
-            << "mm greedy=" << greedy_cov/1000.0 << "mm";
-        // Check if secondary constraints (activation + dodge) consumed
-        // more than 1µm of coverage equivalent in objective value.
-        int64_t coverage_obj = W_COVERAGE * solver_cov;
-        int64_t total_obj = llround(response.objective_value());
-        int64_t secondary_penalty = coverage_obj - total_obj;
-        if (secondary_penalty > W_COVERAGE / 2)
-            BOOST_LOG_TRIVIAL(warning) << "  PENALTY EXCEEDS 0.5µm: secondary="
-                << secondary_penalty << " (coverage_obj=" << coverage_obj
-                << " total_obj=" << total_obj << ")";
+            << "mm committed=" << committed_cov/1000.0 << "mm"
+            << " ceil=" << coverage_ceiling_um/1000.0 << "mm"
+            << " | windows=" << stagger_windows << " terms=" << stagger_terms
+            << " " << response.solution_info();
 
-        if (solver_cov < greedy_cov)
-            BOOST_LOG_TRIVIAL(warning) << "  COVERAGE DROP: lost "
-                << (greedy_cov - solver_cov)/1000.0 << "mm";
+        // The per-cell floors should make this unreachable; checked rather than trusted.
+        if (solver_cov < committed_cov)
+            BOOST_LOG_TRIVIAL(error) << "  COVERAGE DROP: lost "
+                << (committed_cov - solver_cov)/1000.0 << "mm against what was committed";
     } else {
-        // Count frozen intervals per cell for diagnostics
-        int total_frozen = 0;
-        int max_frozen_per_cell = 0;
+        // Interval counts per cell, for diagnosing an unsolvable block.
+        int total_intervals = 0;
+        int max_intervals_per_cell = 0;
         for (const auto &[cell, intervals] : cell_intervals) {
-            // Count non-decision intervals (frozen = total - decision)
             int n = static_cast<int>(intervals.size());
-            if (n > max_frozen_per_cell) max_frozen_per_cell = n;
-            total_frozen += n;
+            if (n > max_intervals_per_cell) max_intervals_per_cell = n;
+            total_intervals += n;
         }
         BOOST_LOG_TRIVIAL(warning) << "MagmaTubeSolver: block solve status="
             << static_cast<int>(response.status())
@@ -884,8 +1076,8 @@ BlockResult MagmaTubeSolver::solve_block(const Block &block) const
             << ", segments=" << all_segments.size()
             << ", cells=" << block.cells.size()
             << ", cell_interval_lists=" << cell_intervals.size()
-            << ", total_intervals=" << total_frozen
-            << ", max_per_cell=" << max_frozen_per_cell;
+            << ", total_intervals=" << total_intervals
+            << ", max_per_cell=" << max_intervals_per_cell;
     }
 
     return result;
@@ -895,65 +1087,61 @@ BlockResult MagmaTubeSolver::solve_block(const Block &block) const
 // solve_pass
 // ============================================================================
 
-int MagmaTubeSolver::solve_pass(int off_a, int off_b, int off_z,
+void MagmaTubeSolver::solve_pass(const std::vector<Block> &blocks,
                                  std::function<void(int)> block_done_fn)
 {
     auto t_start = std::chrono::high_resolution_clock::now();
 
-    std::vector<Block> blocks;
-    build_blocks(off_a, off_b, off_z, blocks);
-
-    // Solve blocks sequentially. CP-SAT uses all available cores internally.
-    // Overlapping blocks are safe — each block commits immediately so the next
-    // block sees the latest state.
+    // Sequential: each block commits before the next, so overlapping blocks see the latest
+    // state. CP-SAT parallelises within a block.
     for (size_t i = 0; i < blocks.size(); ++i) {
-        BlockResult result = solve_block(blocks[i]);
-        commit_results({blocks[i]}, {result});
+        // Re-divide the remaining budget so time unused by easy blocks passes to hard ones.
+        // The floor can push the total past the budget.
+        m_per_block_timeout = std::max(0.5, m_budget_left_sec / std::max(1, m_blocks_left));
+
+        const auto t_block = std::chrono::high_resolution_clock::now();
+        commit_result(blocks[i], solve_block(blocks[i]));
+        const double spent = std::chrono::duration<double>(
+            std::chrono::high_resolution_clock::now() - t_block).count();
+
+        m_budget_left_sec = std::max(0.0, m_budget_left_sec - spent);
+        if (m_blocks_left > 0) --m_blocks_left;
+
         if (block_done_fn) block_done_fn(static_cast<int>(i));
     }
 
     auto t_end = std::chrono::high_resolution_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
 
-    BOOST_LOG_TRIVIAL(debug) << "MagmaTubeSolver: pass(" << off_a << "," << off_b << ","
-        << off_z << "): " << blocks.size() << " blocks, " << ms << "ms";
-
-    return static_cast<int>(blocks.size());
+    BOOST_LOG_TRIVIAL(debug) << "MagmaTubeSolver: pass: "
+        << blocks.size() << " blocks, " << ms << "ms";
 }
 
 // ============================================================================
-// commit_results
+// commit_result
 // ============================================================================
 
-void MagmaTubeSolver::commit_results(const std::vector<Block> &blocks,
-                                      const std::vector<BlockResult> &results)
+void MagmaTubeSolver::commit_result(const Block &block, const BlockResult &result)
 {
-    // Only update edges from blocks that solved successfully.
-    // If a block failed (INFEASIBLE/UNKNOWN), preserve prior committed segments
-    // rather than destroying them — don't make things worse.
-    //
-    // For successful blocks: only remove segments FULLY INSIDE the block's Z
-    // range. Segments extending outside Z belong to other Z levels and must be
-    // preserved. This is the key invariant: a block only modifies what it can
-    // fully see.
-    for (size_t bi = 0; bi < blocks.size(); ++bi) {
-        if (!results[bi].solved) {
-            ++m_unknown_blocks;
-            continue;
-        }
-
-        const Block &block = blocks[bi];
-        for (size_t ei : block.edge_indices) {
-            auto &segs = m_committed[ei];
-            segs.erase(std::remove_if(segs.begin(), segs.end(),
-                [&](const CommittedSegment &s) {
-                    return s.start_um >= block.z_start_um &&
-                           s.end_um   <= block.z_end_um;
-                }), segs.end());
-        }
-        for (const auto &[edge_idx, seg] : results[bi].segments)
-            m_committed[edge_idx].push_back(seg);
+    if (result.outcome == BlockOutcome::NoWork)
+        return;
+    if (result.outcome == BlockOutcome::Failed) {
+        ++m_failed_blocks;
+        return;
     }
+
+    // Replace only segments fully inside this block's Z range: a block modifies only what it
+    // can fully see. Segments extending outside were frozen in its model.
+    for (size_t ei : block.edge_indices) {
+        auto &segs = m_committed[ei];
+        segs.erase(std::remove_if(segs.begin(), segs.end(),
+            [&](const CommittedSegment &s) {
+                return s.start_um >= block.z_start_um &&
+                       s.end_um   <= block.z_end_um;
+            }), segs.end());
+    }
+    for (const auto &[edge_idx, seg] : result.segments)
+        m_committed[edge_idx].push_back(seg);
 }
 
 // ============================================================================
@@ -962,7 +1150,7 @@ void MagmaTubeSolver::commit_results(const std::vector<Block> &blocks,
 
 void MagmaTubeSolver::extract_results(
     std::vector<UTubePair> &out_pairs,
-    std::unordered_map<TriangleCell, std::vector<int>, TriangleCellHash> &out_index) const
+    std::unordered_map<CellId, std::vector<int>, CellIdHash> &out_index) const
 {
     out_pairs.clear();
     out_index.clear();
@@ -1001,41 +1189,29 @@ void MagmaTubeSolver::extract_results(
     }
 
     BOOST_LOG_TRIVIAL(info) << "MagmaTubeSolver: extracted " << out_pairs.size() << " pairs";
-
-    validate_committed(m_edges, m_edge_index, m_committed, m_cells,
-                       m_um, m_layer_data, m_min_h_mm, m_max_h_mm,
-                       m_num_layers, "FINAL");
 }
 
 // ============================================================================
-// validate_committed — reusable validation for committed segments
+// validate_and_report — per-label validation + diagnostics
 // ============================================================================
 
-ValidationResult validate_committed(
-    const std::vector<EdgeData>                                            &edges,
-    const std::unordered_map<CellEdge, size_t, CellEdgeHash>              &edge_index,
-    const std::vector<std::vector<CommittedSegment>>                       &committed,
-    const std::unordered_map<TriangleCell, CellPresence, TriangleCellHash> &cells,
-    const MicronTables                                                     &um,
-    const std::vector<LayerData>                                           &layer_data,
-    double min_h_mm, double max_h_mm, int num_layers,
-    const char *label)
+void MagmaTubeSolver::validate_and_report(const char *label) const
 {
     ValidationResult result;
 
     // Build per-cell segment list for overlap checking
-    std::unordered_map<TriangleCell, std::vector<std::pair<int, int>>,
-                       TriangleCellHash> cell_segments; // (start_layer, end_layer)
+    std::unordered_map<CellId, std::vector<std::pair<int, int>>,
+                       CellIdHash> cell_segments; // (start_layer, end_layer)
 
     int total_segs = 0;
-    for (size_t ei = 0; ei < edges.size(); ++ei) {
-        const EdgeData &ed = edges[ei];
-        for (const CommittedSegment &seg : committed[ei]) {
+    for (size_t ei = 0; ei < m_edges.size(); ++ei) {
+        const EdgeData &ed = m_edges[ei];
+        for (const CommittedSegment &seg : m_committed[ei]) {
             ++total_segs;
-            auto start_it = um.bottom_to_layer.find(seg.start_um);
-            auto end_it   = um.top_to_layer.find(seg.end_um);
-            if (start_it == um.bottom_to_layer.end() ||
-                end_it   == um.top_to_layer.end()) {
+            auto start_it = m_um.bottom_to_layer.find(seg.start_um);
+            auto end_it   = m_um.top_to_layer.find(seg.end_um);
+            if (start_it == m_um.bottom_to_layer.end() ||
+                end_it   == m_um.top_to_layer.end()) {
                 if (++result.bad_range <= 3)
                     BOOST_LOG_TRIVIAL(warning) << label << ": invalid micron boundary "
                         << seg.start_um << "-" << seg.end_um;
@@ -1046,7 +1222,7 @@ ValidationResult validate_committed(
             int eL = end_it->second;
 
             // 1. Valid layer range
-            if (sL < 0 || eL >= num_layers || sL > eL) {
+            if (sL < 0 || eL >= m_num_layers || sL > eL) {
                 if (++result.bad_range <= 3)
                     BOOST_LOG_TRIVIAL(warning) << label << ": tube invalid range L"
                         << sL << "-" << eL;
@@ -1054,30 +1230,23 @@ ValidationResult validate_committed(
             }
 
             // 2. Height bounds
-            double h_mm = layer_data[eL].print_z
-                        - (layer_data[sL].print_z - layer_data[sL].height);
-            if (h_mm < min_h_mm - 0.01) {
+            double h_mm = m_layer_data[eL].print_z
+                        - (m_layer_data[sL].print_z - m_layer_data[sL].height);
+            if (h_mm < m_min_h_mm - 0.01) {
                 if (++result.bad_short <= 3)
                     BOOST_LOG_TRIVIAL(warning) << label << ": tube too short: "
-                        << h_mm << "mm (min=" << min_h_mm << ") L" << sL << "-" << eL;
+                        << h_mm << "mm (min=" << m_min_h_mm << ") L" << sL << "-" << eL;
             }
-            if (h_mm > max_h_mm + 0.01) {
+            if (h_mm > m_max_h_mm + 0.01) {
                 if (++result.bad_long <= 3)
                     BOOST_LOG_TRIVIAL(warning) << label << ": tube too long: "
-                        << h_mm << "mm (max=" << max_h_mm << ") L" << sL << "-" << eL;
+                        << h_mm << "mm (max=" << m_max_h_mm << ") L" << sL << "-" << eL;
             }
 
-            // 3. Edge exists
-            CellEdge ce(ed.edge.a, ed.edge.b);
-            if (edge_index.find(ce) == edge_index.end()) {
-                if (++result.bad_edge <= 3)
-                    BOOST_LOG_TRIVIAL(warning) << label << ": cells are not a valid edge";
-            }
-
-            // 4. Both cells present at every layer
-            auto it_a = cells.find(ed.edge.a);
-            auto it_b = cells.find(ed.edge.b);
-            if (it_a != cells.end() && it_b != cells.end()) {
+            // 3. Both cells present at every layer
+            auto it_a = m_cells.find(ed.edge.a);
+            auto it_b = m_cells.find(ed.edge.b);
+            if (it_a != m_cells.end() && it_b != m_cells.end()) {
                 for (int L = sL; L <= eL; ++L) {
                     if (!it_a->second.present(L) || !it_b->second.present(L)) {
                         if (++result.bad_presence <= 3)
@@ -1093,7 +1262,7 @@ ValidationResult validate_committed(
         }
     }
 
-    // 5. Per-cell overlap
+    // 4. Per-cell overlap
     for (const auto &[cell, segs] : cell_segments) {
         for (size_t i = 0; i < segs.size(); ++i) {
             for (size_t j = i + 1; j < segs.size(); ++j) {
@@ -1110,9 +1279,9 @@ ValidationResult validate_committed(
         }
     }
 
-    // 6. Per-edge overlap
-    for (size_t ei = 0; ei < edges.size(); ++ei) {
-        const auto &segs = committed[ei];
+    // 5. Per-edge overlap
+    for (size_t ei = 0; ei < m_edges.size(); ++ei) {
+        const auto &segs = m_committed[ei];
         for (size_t i = 0; i < segs.size(); ++i) {
             for (size_t j = i + 1; j < segs.size(); ++j) {
                 if (segs[i].start_um < segs[j].end_um &&
@@ -1131,50 +1300,299 @@ ValidationResult validate_committed(
     if (result.total_issues())
         BOOST_LOG_TRIVIAL(warning) << label << ": " << result.total_issues() << " issues ("
             << result.bad_short << " short, " << result.bad_long << " long, "
-            << result.bad_range << " bad-range, " << result.bad_edge << " bad-edge, "
+            << result.bad_range << " bad-range, "
             << result.bad_presence << " not-present, "
             << result.overlap_cell << " cell-overlap, "
             << result.overlap_edge << " edge-overlap)";
     else
         BOOST_LOG_TRIVIAL(info) << label << ": all " << total_segs << " segments OK";
 
-    // Coverage summary
-    {
-        double total_presence_um = 0, total_covered_um = 0;
-        int cells_below_50 = 0, cells_below_25 = 0, cells_zero = 0;
-        for (const auto &[cell, presence] : cells) {
-            int64_t presence_um = um.top_um[presence.last_layer]
-                                - um.bottom_um[presence.first_layer];
-            if (presence_um <= 0) continue;
+    report_coverage(cell_segments, label);
+    report_lengths(label);
+    report_stagger(label);
+}
 
-            int64_t covered_um = 0;
-            auto it = cell_segments.find(cell);
-            if (it != cell_segments.end()) {
-                for (const auto &[sL, eL] : it->second) {
-                    covered_um += um.top_um[eL] - um.bottom_um[sL];
-                }
-                // Each segment counted twice (once per cell), but we're iterating
-                // per-cell so each cell sees its own segments. However segments
-                // appear in cell_segments for BOTH cells of the edge, so each
-                // cell correctly sees all its tubes.
-            }
-            double pct = double(covered_um) / double(presence_um);
-            total_presence_um += presence_um;
-            total_covered_um  += covered_um;
-            if (covered_um == 0) ++cells_zero;
-            else if (pct < 0.25) ++cells_below_25;
-            else if (pct < 0.50) ++cells_below_50;
+// ============================================================================
+// report_coverage — how much of each cell's presence range ended up in a tube
+// ============================================================================
+
+void MagmaTubeSolver::report_coverage(
+    const std::unordered_map<CellId, std::vector<std::pair<int, int>>,
+                             CellIdHash> &cell_segments,
+    const char *label) const
+{
+    double total_presence_um = 0, total_covered_um = 0;
+    int cells_below_50 = 0, cells_below_25 = 0, cells_zero = 0;
+    for (const auto &[cell, presence] : m_cells) {
+        // Only layers the cell is present on: presence can have gaps (see CellPresence),
+        // which no tube may cross.
+        int64_t presence_um = 0;
+        for (int L = presence.first_layer; L <= presence.last_layer; ++L)
+            if (presence.present(L))
+                presence_um += m_um.top_um[L] - m_um.bottom_um[L];
+        if (presence_um <= 0) continue;
+
+        int64_t covered_um = 0;
+        auto it = cell_segments.find(cell);
+        if (it != cell_segments.end()) {
+            // A tube counts for both of its cells, since it reinforces both.
+            for (const auto &[sL, eL] : it->second)
+                covered_um += m_um.top_um[eL] - m_um.bottom_um[sL];
         }
-        double overall_pct = total_presence_um > 0
-            ? total_covered_um / total_presence_um * 100.0 : 0.0;
-        BOOST_LOG_TRIVIAL(info) << label << " COVERAGE: " << std::fixed << std::setprecision(1)
-            << overall_pct << "% overall, "
-            << cells_zero << " cells unfilled, "
-            << cells_below_25 << " cells <25%, "
-            << cells_below_50 << " cells <50%";
+        double pct = double(covered_um) / double(presence_um);
+        total_presence_um += presence_um;
+        total_covered_um  += covered_um;
+        // Cumulative bands: a cell under 25% is also counted under 50%.
+        if (covered_um == 0) ++cells_zero;
+        if (pct < 0.25)      ++cells_below_25;
+        if (pct < 0.50)      ++cells_below_50;
+    }
+    double overall_pct = total_presence_um > 0
+        ? total_covered_um / total_presence_um * 100.0 : 0.0;
+    BOOST_LOG_TRIVIAL(info) << label << " COVERAGE: " << std::fixed << std::setprecision(1)
+        << overall_pct << "% overall, "
+        << cells_zero << " cells unfilled, "
+        << cells_below_25 << " cells <25%, "
+        << cells_below_50 << " cells <50%";
+}
+
+// ============================================================================
+// report_lengths — tube-height distribution
+// ============================================================================
+// Uniform tube heights put every boundary on one regular grid, so the height spread
+// predicts the stagger numbers.
+
+void MagmaTubeSolver::report_lengths(const char *label) const
+{
+    std::vector<int64_t> heights;
+    for (const auto &segs : m_committed)
+        for (const CommittedSegment &seg : segs)
+            heights.push_back(seg.end_um - seg.start_um);
+
+    if (heights.empty()) {
+        BOOST_LOG_TRIVIAL(info) << label << " LENGTHS: no tubes";
+        return;
     }
 
-    return result;
+    std::sort(heights.begin(), heights.end());
+    const size_t  n      = heights.size();
+    const int64_t min_um = heights.front();
+    const int64_t max_um = heights.back();
+    const int64_t med_um = heights[n / 2];
+    int64_t sum_um = 0;
+    for (int64_t h : heights) sum_um += h;
+
+    // Distinct heights, most common first. Tubes snap to layer boundaries, so the list is short.
+    std::vector<std::pair<int64_t, size_t>> hist; // (height_um, count)
+    for (int64_t h : heights) {
+        if (!hist.empty() && hist.back().first == h) ++hist.back().second;
+        else hist.push_back({h, 1});
+    }
+    const size_t distinct = hist.size();
+    std::sort(hist.begin(), hist.end(),
+              [](const auto &x, const auto &y) { return x.second > y.second; });
+
+    std::ostringstream top;
+    for (size_t i = 0; i < hist.size() && i < 5; ++i)
+        top << (i ? ", " : "") << std::fixed << std::setprecision(2)
+            << hist[i].first / 1000.0 << "mm x" << hist[i].second;
+
+    // Same-edge abutments: consecutive tubes on one edge that meet exactly. Non-zero on the
+    // GREEDY line but zero on CPSAT suggests the warm-start hint is being rejected (see the
+    // slot ordering constraint in solve_block).
+    size_t abutments = 0;
+    std::vector<CommittedSegment> ordered;
+    for (const auto &segs : m_committed) {
+        if (segs.size() < 2) continue;
+        ordered.assign(segs.begin(), segs.end());
+        std::sort(ordered.begin(), ordered.end(),
+                  [](const CommittedSegment &x, const CommittedSegment &y) {
+                      return x.start_um < y.start_um;
+                  });
+        for (size_t i = 1; i < ordered.size(); ++i)
+            if (ordered[i].start_um == ordered[i - 1].end_um) ++abutments;
+    }
+
+    BOOST_LOG_TRIVIAL(info) << label << " LENGTHS: " << n << " tubes, "
+        << std::fixed << std::setprecision(2)
+        << "min=" << min_um / 1000.0
+        << " median=" << med_um / 1000.0
+        << " mean=" << double(sum_um) / double(n) / 1000.0
+        << " max=" << max_um / 1000.0 << "mm"
+        << " (cap " << m_max_h_mm << "mm)"
+        << " | " << distinct << " distinct: " << top.str()
+        << (distinct > 5 ? ", ..." : "")
+        << " | " << abutments << " same-edge abutments";
+}
+
+// ============================================================================
+// report_stagger — how far apart neighbouring tube boundaries sit
+// ============================================================================
+// Boundaries at the same Z across touching cells form a plane the part can split along.
+// For each cell, gathers the boundaries of its own tubes (Ring-0) and its neighbours'
+// (Ring-1), the same neighbourhood the stagger objective uses, and scores pairs closer than
+// the horizon, split into avoidable and forced.
+
+void MagmaTubeSolver::report_stagger(const char *label) const
+{
+    const int64_t horizon_um = stagger_horizon_um(llround(m_min_h_mm * 1000.0));
+    if (horizon_um <= 0) {
+        BOOST_LOG_TRIVIAL(warning) << label
+            << " STAGGER: no horizon -- min tube height is zero, which should be impossible";
+        return;
+    }
+    const int64_t tight_um = std::max<int64_t>(1, horizon_um / 2);
+
+    // Each segment contributes two boundaries to both of its cells. A boundary carries its
+    // segment id so duplicates (one segment reached via several cells) are removed without
+    // merging two different tubes that break at the same Z, and its edge so a pair can be
+    // classified.
+    struct Boundary {
+        int64_t  z_um;
+        uint32_t seg_uid;
+        size_t   edge_idx;
+    };
+    std::unordered_map<CellId, std::vector<Boundary>, CellIdHash> cell_bounds;
+    uint32_t next_uid = 0;
+    for (size_t ei = 0; ei < m_edges.size(); ++ei) {
+        for (const CommittedSegment &seg : m_committed[ei]) {
+            const uint32_t uid = next_uid++;
+            for (const CellId &c : {m_edges[ei].edge.a, m_edges[ei].edge.b}) {
+                cell_bounds[c].push_back({seg.start_um, uid, ei});
+                cell_bounds[c].push_back({seg.end_um,   uid, ei});
+            }
+        }
+    }
+    if (next_uid == 0) {
+        BOOST_LOG_TRIVIAL(info) << label << " STAGGER: no tubes";
+        return;
+    }
+
+    auto shares_cell = [&](size_t ei, size_t ej) {
+        const CellEdge &A = m_edges[ei].edge, &B = m_edges[ej].edge;
+        return A.a == B.a || A.a == B.b || A.b == B.a || A.b == B.b;
+    };
+
+    // Pairs are reported in two populations. Forced seams grow with coverage and no solver
+    // choice removes them, so mixing them in would make the count track coverage, not stagger.
+    //   AVOIDABLE -- the two tubes share no cell: independent columns breaking at the same Z.
+    //   FORCED    -- the two tubes share a cell, whose column they tile, so they can only come
+    //                close by abutting, which full coverage requires.
+    // The stagger objective scores both populations.
+    struct Bucket {
+        size_t  pairs = 0, within_tight = 0, coincident = 0;
+        int64_t shortfall_um = 0;
+        int64_t min_gap_um = std::numeric_limits<int64_t>::max();
+    };
+    Bucket avoidable, forced;
+
+    // A pair reachable from several cells' neighbourhoods is counted once.
+    std::set<std::array<int64_t, 4>> seen_pairs;
+    std::unordered_map<CellId, size_t, CellIdHash> cell_offences;
+
+    std::vector<Boundary> nb;
+    for (const auto &cell_entry : m_cells) {
+        const CellId &cell = cell_entry.first;
+        nb.clear();
+        auto append = [&](const CellId &c) {
+            auto it = cell_bounds.find(c);
+            if (it != cell_bounds.end())
+                nb.insert(nb.end(), it->second.begin(), it->second.end());
+        };
+        append(cell);
+        for (const CellId &nbr : m_lattice.neighbors(cell))
+            append(nbr);
+        if (nb.size() < 2) continue;
+
+        std::sort(nb.begin(), nb.end(), [](const Boundary &x, const Boundary &y) {
+            return x.z_um != y.z_um ? x.z_um < y.z_um : x.seg_uid < y.seg_uid;
+        });
+        nb.erase(std::unique(nb.begin(), nb.end(),
+                     [](const Boundary &x, const Boundary &y) {
+                         return x.z_um == y.z_um && x.seg_uid == y.seg_uid;
+                     }),
+                 nb.end());
+
+        // Sliding window: only boundaries within the horizon can score at all.
+        for (size_t i = 0; i < nb.size(); ++i) {
+            for (size_t j = i + 1; j < nb.size(); ++j) {
+                const int64_t gap = nb[j].z_um - nb[i].z_um;
+                if (gap >= horizon_um) break;  // at the target is not under it
+                if (nb[i].seg_uid == nb[j].seg_uid) continue;  // one tube's own two ends
+
+                std::array<int64_t, 4> key{
+                    int64_t(std::min(nb[i].seg_uid, nb[j].seg_uid)),
+                    int64_t(std::max(nb[i].seg_uid, nb[j].seg_uid)),
+                    std::min(nb[i].z_um, nb[j].z_um),
+                    std::max(nb[i].z_um, nb[j].z_um)};
+                if (!seen_pairs.insert(key).second) continue;
+
+                const bool  is_forced = shares_cell(nb[i].edge_idx, nb[j].edge_idx);
+                Bucket     &b         = is_forced ? forced : avoidable;
+                ++b.pairs;
+                b.shortfall_um += horizon_um - gap;
+                if (gap < tight_um) ++b.within_tight;
+                if (gap == 0)       ++b.coincident;
+                b.min_gap_um = std::min(b.min_gap_um, gap);
+                if (!is_forced) ++cell_offences[cell];
+            }
+        }
+    }
+
+    BOOST_LOG_TRIVIAL(info) << label << " STAGGER: target "
+        << std::fixed << std::setprecision(2) << horizon_um / 1000.0 << "mm | AVOIDABLE "
+        << avoidable.pairs << " pairs under target ("
+        << avoidable.within_tight << " under half, " << avoidable.coincident
+        << " coincident), total shortfall "
+        << avoidable.shortfall_um / 1000.0 << "mm, closest "
+        << (avoidable.pairs ? avoidable.min_gap_um / 1000.0 : 0.0) << "mm"
+        << " | FORCED (same-cell seams, unavoidable at full coverage) "
+        << forced.pairs << " pairs, " << forced.coincident << " coincident";
+
+    // Weak-plane census: cells with a boundary at each Z, over all boundaries, not split into
+    // avoidable and forced.
+    std::unordered_map<int64_t, int> plane_cells;
+    std::vector<int64_t> zs;
+    for (const auto &bounds_entry : cell_bounds) {
+        const std::vector<Boundary> &bounds = bounds_entry.second;
+        zs.clear();
+        zs.reserve(bounds.size());
+        for (const Boundary &b : bounds) zs.push_back(b.z_um);
+        std::sort(zs.begin(), zs.end());
+        zs.erase(std::unique(zs.begin(), zs.end()), zs.end());
+        for (int64_t z : zs) ++plane_cells[z];
+    }
+    std::vector<std::pair<int, int64_t>> planes;
+    planes.reserve(plane_cells.size());
+    for (const auto &pc : plane_cells) planes.push_back({pc.second, pc.first});
+    std::sort(planes.begin(), planes.end(), std::greater<>());
+
+    const double total_cells = double(std::max<size_t>(1, m_cells.size()));
+    if (!planes.empty())
+        BOOST_LOG_TRIVIAL(info) << label << " PLANES: " << planes.size()
+            << " distinct boundary Z, worst is Z=" << std::fixed << std::setprecision(3)
+            << planes[0].second / 1000.0 << "mm shared by " << planes[0].first
+            << "/" << m_cells.size() << " cells (" << std::setprecision(1)
+            << 100.0 * double(planes[0].first) / total_cells << "%)";
+
+    for (size_t i = 0; i < planes.size() && i < 10; ++i)
+        BOOST_LOG_TRIVIAL(debug) << label << " PLANE #" << i << ": Z="
+            << std::fixed << std::setprecision(3) << planes[i].second / 1000.0
+            << "mm, " << planes[i].first << " cells ("
+            << std::setprecision(1)
+            << 100.0 * double(planes[i].first) / total_cells << "%)";
+
+    std::vector<std::pair<size_t, CellId>> offenders;
+    offenders.reserve(cell_offences.size());
+    for (const auto &co : cell_offences) offenders.push_back({co.second, co.first});
+    std::sort(offenders.begin(), offenders.end(),
+              [](const auto &x, const auto &y) { return x.first > y.first; });
+    for (size_t i = 0; i < offenders.size() && i < 10; ++i)
+        BOOST_LOG_TRIVIAL(debug) << label << " CROWDED #" << i << ": cell ("
+            << offenders[i].second.a << "," << offenders[i].second.b << ","
+            << offenders[i].second.c << ") " << offenders[i].first
+            << " avoidable pairs within " << std::fixed << std::setprecision(2)
+            << horizon_um / 1000.0 << "mm";
 }
 
 } // namespace magma

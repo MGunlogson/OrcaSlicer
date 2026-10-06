@@ -66,6 +66,30 @@ orcaslicer_add_cmake_project(ORTools
         -DUSE_HIGHS=OFF
         -DUSE_PDLP=OFF
         ${_ortools_flatpak_args}
+    DEPENDS dep_Eigen
+)
+
+# OR-Tools' BUILD_DEPS=ON builds AND INSTALLS its own eigen3 (3.4.0) into the shared dep
+# prefix, overwriting the 5.0.1 that dep_Eigen installed ~40 build steps earlier. Nothing
+# reports this; the slicer just fails to configure later with
+#   "Could not find a configuration file for package Eigen3 compatible with 5.0.1"
+# which points nowhere near OR-Tools. It was invisible until the upstream merge moved
+# OrcaSlicer from Eigen 3.4.0 to 5.0.1 -- before that, both copies were the same version.
+#
+# There is no switch to stop it: INSTALL_BUILD_DEPS is declared in 9.15 but never referenced,
+# and BUILD_Eigen3 is force-flipped back ON by CMAKE_DEPENDENT_OPTION whenever BUILD_DEPS
+# is ON. Installing OR-Tools into a private prefix was tried and rejected: its bundled
+# protobuf and absl are shared libraries, and moving them out of the shared lib dir breaks
+# the AppImage bundler's runtime-dependency resolution (build_linux_image.sh).
+#
+# So let it install, then re-assert ours. Eigen is header-only, so this is a file copy.
+# DEPENDS dep_Eigen above guarantees ours is built before this step runs.
+# NOTE: if OR-Tools ever starts bundling another dep we also build, add it here. Today the
+# only overlap is Eigen -- dep_ZLIB is not built on this platform.
+ExternalProject_Add_Step(dep_ORTools restore_shared_eigen
+    DEPENDEES install
+    COMMENT "Restoring Eigen overwritten by OR-Tools' bundled copy"
+    COMMAND ${CMAKE_COMMAND} --install ${CMAKE_BINARY_DIR}/dep_Eigen-prefix/src/dep_Eigen-build --prefix ${DESTDIR}
 )
 
 if (MSVC)

@@ -14,6 +14,7 @@
 // needed for tech VGCODE_ENABLE_COG_AND_TOOL_MARKERS
 #include <libvgcode/include/Types.hpp>
 
+#include <array>
 #include <cstdint>
 #include <float.h>
 #include <set>
@@ -33,7 +34,8 @@ class OpenGLManager;
 static const float GCODE_VIEWER_SLIDER_SCALE = 0.6f;
 static const float SLIDER_DEFAULT_RIGHT_MARGIN  = 10.0f;
 static const float SLIDER_DEFAULT_BOTTOM_MARGIN = 10.0f;
-static const float SLIDER_RIGHT_MARGIN = 124.0f;
+// ORCA: match right margin to the vertical slider window width to prevent overlap.
+static inline const float SLIDER_RIGHT_MARGIN = IMSlider::vertical_slider_window_width();
 static const float SLIDER_BOTTOM_MARGIN = 64.0f;
 class GCodeViewer
 {
@@ -171,22 +173,20 @@ public:
         int  print_modify_count{-1};
         bool previewing{false};
     };
-    // Zone boundary: Processing stages for interior shell visualization
+    // Debug view of the dual infill zone interior shell, before and after smoothing.
     enum class ZoneBoundaryStage { Off, Initial, Smoothed };
-    // Zone boundary: Cached mesh data for a single object's stages
     struct ZoneCachedObject {
         std::array<TriangleMesh, 2> stage_meshes;  // [Initial, Smoothed]
-        std::vector<Transform3d> instance_transforms;  // One transform per instance
+        std::vector<Transform3d> instance_transforms;  // printable instances only
         double raft_z_offset{0.0};  // slicing_parameters.object_print_z_min
         bool has_data{false};
     };
-    // Zone boundary: helper to render interior shell boundaries for debugging
     struct ZoneBoundaryShells
     {
         GLVolumeCollection volumes;
         bool visible{true};
         ZoneBoundaryStage stage{ZoneBoundaryStage::Off};
-        // Cache - valid until model changes (cleared on reset_shell)
+        // Valid for print_id / print_modify_count; cleared by reset_shell()
         std::vector<ZoneCachedObject> cached_objects;
         bool cache_valid{false};
         int  print_id{-1};
@@ -197,7 +197,7 @@ public:
     GCodeCheckResult  m_gcode_check_result;
     FilamentPrintableResult filament_printable_reuslt;
     Shells            m_shells;
-    ZoneBoundaryShells m_zone_shells;  // Zone interior shell debug visualization
+    ZoneBoundaryShells m_zone_shells;
 
 private:
     std::vector<int> m_plater_extruder;
@@ -205,6 +205,9 @@ private:
     unsigned int m_last_result_id{ 0 };
     //BBS: save m_gcode_result as well
     const GCodeProcessorResult* m_gcode_result;
+    std::array<unsigned int, static_cast<size_t>(EMoveType::Count)> m_move_type_counts{};
+    std::array<std::array<float, static_cast<size_t>(PrintEstimatedStatistics::ETimeMode::Count)>, static_cast<size_t>(EMoveType::Count)> m_move_type_times{};
+    std::array<float, static_cast<size_t>(EMoveType::Count)> m_move_type_distances{};
     //BBS: add only gcode mode
     bool m_only_gcode_in_preview {false};
 
@@ -243,6 +246,7 @@ private:
     std::vector<libvgcode::EViewType> view_type_items;
     std::vector<std::string> view_type_items_str;
     int       m_view_type_sel = 0;
+    int       m_last_extruder_count_default_applied{0};  // 0=unset, 1=single, 2+=multi
     std::vector<EMoveType> options_items;
 
     bool m_legend_visible{ true };
@@ -286,14 +290,14 @@ public:
     void reset_shell();
     void load_shells(const Print& print, bool initialized, bool force_previewing = false);
     void set_shells_on_preview(bool is_previewing) { m_shells.previewing = is_previewing; }
-    // Zone boundary: Load and render interior shell boundaries
+    // Zone boundary debug view
     void load_zone_shells(const Print& print);
-    void rebuild_zone_volumes();  // Rebuild GLVolumes from cached stage data
+    void rebuild_zone_volumes();
     void set_zone_shells_visible(bool visible) { m_zone_shells.visible = visible; }
     bool are_zone_shells_visible() const { return m_zone_shells.visible; }
     void set_zone_boundary_stage(ZoneBoundaryStage stage);
     ZoneBoundaryStage get_zone_boundary_stage() const { return m_zone_shells.stage; }
-    void cycle_zone_boundary_stage();  // Toggles Initial <-> Smoothed
+    void cycle_zone_boundary_stage();  // Off -> Initial -> Smoothed -> Off
     //BBS: add all plates filament statistics
     void render_all_plates_stats(const std::vector<const GCodeProcessorResult*>& gcode_result_list, bool show = true) const;
     //BBS: GUI refactor: add canvas width and height
@@ -357,6 +361,13 @@ public:
 
     libvgcode::EViewType get_view_type() const { return m_viewer.get_view_type(); }
 
+    // ORCA: darken the layers not scrubbed to while using the preview layer slider
+    void set_dim_previous_layers(bool value) { m_viewer.set_dim_previous_layers(value); }
+    bool is_dim_previous_layers() const { return m_viewer.is_dim_previous_layers(); }
+    // ORCA: brightness of those darkened layers, 1.0 = unchanged, 0.0 = black
+    void set_dim_previous_layers_brightness(float value) { m_viewer.set_dim_previous_layers_brightness(value); }
+    float get_dim_previous_layers_brightness() const { return m_viewer.get_dim_previous_layers_brightness(); }
+
     void set_layers_z_range(const std::array<unsigned int, 2>& layers_z_range);
 
     bool is_legend_shown() const { return m_legend_visible && m_legend_enabled; }
@@ -382,7 +393,7 @@ private:
     //void load_shells(const Print& print);
     void render_toolpaths();
     void render_shells(int canvas_width, int canvas_height);
-    void render_zone_shells(int canvas_width, int canvas_height);  // Zone interior shell debug
+    void render_zone_shells(int canvas_width, int canvas_height);
 
     //BBS: GUI refactor: add canvas size
     void render_legend(float &legend_height, int canvas_width, int canvas_height, int right_margin);

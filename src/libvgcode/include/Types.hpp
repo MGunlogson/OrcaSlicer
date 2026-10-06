@@ -153,15 +153,12 @@ enum class EGCodeExtrusionRole : uint8_t
       Brim,
       SupportTransition,
       Mixed,
-      // Dual infill zone outer infill (Magma Triangle U-tube pattern)
+      // Magma: tube-channel infill, walls between outer and inner zones, zone floor/ceiling,
+      // and the stationary injection extrusion that fills the tubes.
       ZoneOuterInfill,
-      // Zone shell walls (perimeters between outer and inner zones)
       ZoneShell,
-      // Zone floor (bottom of zone boundary)
       ZoneFloor,
-      // Zone ceiling (top of zone boundary, bridges over inner zone)
       ZoneCeiling,
-      // Magma injection (stationary extrude to fill tubes)
       MagmaInjection,
     COUNT
 };

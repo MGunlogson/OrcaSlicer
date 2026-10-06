@@ -22,6 +22,32 @@ namespace Slic3r {
 bool PrintObject::clip_multipart_objects = true;
 bool PrintObject::infill_only_where_needed = false;
 
+static coordf_t compute_slice_z(PrintObject* print_object, size_t i_layer, coordf_t lo, coordf_t hi)
+{
+    bool zaa_active   = false;
+    coordf_t z_offset = 0.0;
+
+    size_t num_regions = print_object->num_printing_regions();
+    for (size_t rid = 0; rid < num_regions; ++rid) {
+        const auto& rcfg = print_object->printing_region(rid).config();
+        if (rcfg.zaa_enabled) {
+            if (!zaa_active || rcfg.zaa_min_z < z_offset)
+                z_offset = rcfg.zaa_min_z;
+            zaa_active = true;
+        }
+    }
+
+    if (!zaa_active || i_layer == 0) {
+        return 0.5 * (lo + hi);
+    }
+
+    coordf_t slice_z = lo + z_offset;
+    if ((slice_z < lo && !is_approx(slice_z, lo)) || (slice_z > hi && !is_approx(slice_z, hi))) {
+        throw RuntimeError("Bad min Z value");
+    }
+    return slice_z;
+}
+
 LayerPtrs new_layers(
     PrintObject                 *print_object,
     // Object layers (pairs of bottom/top Z coordinate), without the raft.
@@ -35,24 +61,8 @@ LayerPtrs new_layers(
     for (size_t i_layer = 0; i_layer < object_layers.size(); i_layer += 2) {
         coordf_t lo = object_layers[i_layer];
         coordf_t hi = object_layers[i_layer + 1];
-        coordf_t slice_z = 0.5 * (lo + hi);
-        bool zaa_active = false;
-        coordf_t z_offset = 0.0;
-        size_t num_regions = print_object->num_printing_regions();
-        for (size_t rid = 0; rid < num_regions; ++rid) {
-            const auto &rcfg = print_object->printing_region(rid).config();
-            if (rcfg.zaa_enabled) {
-                if (!zaa_active || rcfg.zaa_min_z < z_offset)
-                    z_offset = rcfg.zaa_min_z;
-                zaa_active = true;
-            }
-        }
-        if (zaa_active) {
-            slice_z = lo + z_offset;
-            if ((slice_z < lo && !is_approx(slice_z, lo)) || (slice_z > hi && !is_approx(slice_z, hi))) {
-                throw RuntimeError("Bad min Z value");
-            }
-        }
+        coordf_t slice_z = compute_slice_z(print_object, i_layer, lo, hi);
+
         Layer *layer = new Layer(id ++, print_object, hi - lo, hi + zmin, slice_z);
         out.emplace_back(layer);
         if (prev != nullptr) {
@@ -350,7 +360,7 @@ static std::vector<std::vector<ExPolygons>> slices_to_regions(
                         bool rhs_empty  = rhs.region_id < 0 || rhs.expolygons.empty();
                         // Sort the empty items to the end of the list.
                         // Sort by region_id & volume_id lexicographically.
-                        return ! this_empty && (rhs_empty || (this->region_id < rhs.region_id || (this->region_id == rhs.region_id && volume_id < volume_id)));
+                        return ! this_empty && (rhs_empty || (this->region_id < rhs.region_id || (this->region_id == rhs.region_id && volume_id < rhs.volume_id)));
                     }
                 };
 
@@ -820,7 +830,7 @@ void PrintObject::slice()
     this->slice_volumes();
     m_print->throw_if_canceled();
 
-    // Zone: Compute 3D shell and slice it for zone boundaries
+    // Zone: per-layer zone_boundary from the 3D shell
     this->compute_zone_boundary();
     m_print->throw_if_canceled();
 
@@ -1591,15 +1601,12 @@ std::vector<Polygons> PrintObject::slice_support_volumes(const ModelVolumeType m
     return slices;
 }
 
-// Zone: Compute 3D shell using SLA hollowing infrastructure and slice it
+// Zone: build the 3D zone shell with SLA hollowing and slice it into Layer::zone_boundary.
 void PrintObject::compute_zone_boundary()
 {
-    // Clear old stage meshes before computing new ones
-    // This prevents stale data from persisting when re-slicing
     m_zone_stages.initial.clear();
     m_zone_stages.smoothed.clear();
 
-    // Check if dual infill zones is enabled for any region of this object
     bool zone_enabled = false;
     for (const auto &region_ref : this->all_regions()) {
         if (region_ref.get().config().dual_infill_enabled) {
@@ -1607,32 +1614,20 @@ void PrintObject::compute_zone_boundary()
             break;
         }
     }
-    if (!zone_enabled || m_layers.empty()) {
+    // One zone boundary per object, so its dimensions are object config.
+    const double outer_width     = this->config().dual_infill_outer_width.value;
+    const double min_inner_width = this->config().dual_infill_min_inner_width.value;
+    if (!zone_enabled || m_layers.empty() || outer_width <= 0) {
         m_zone_interior.reset();
         return;
     }
 
-    // Get zone config from first enabled region
-    double outer_width = 0;
-    double min_inner_width = 0;
-    for (const auto &region_ref : this->all_regions()) {
-        if (region_ref.get().config().dual_infill_enabled) {
-            outer_width = region_ref.get().config().dual_infill_outer_width.value;
-            min_inner_width = region_ref.get().config().dual_infill_min_inner_width.value;
-            break;
-        }
-    }
-    if (outer_width <= 0)
-        return;
-
-    // Report progress: Zone boundary computation started
     m_print->set_status(6, L("Computing zone boundary"));
     m_print->throw_if_canceled();
 
-    // Generate 3D interior shell using SLA hollowing infrastructure
     sla::HollowingConfig cfg;
     cfg.min_thickness = outer_width;
-    cfg.quality = 0.0;  // Low resolution (0.29mm voxels) — sufficient for zone classification, smoothing blurs voxel artifacts
+    cfg.quality = 0.0;  // 0.29mm voxels; enough for zone classification, and smoothing hides the voxel artifacts
     cfg.closing_distance = 0.5;
 
     TriangleMesh mesh = this->model_object()->raw_mesh();
@@ -1644,26 +1639,21 @@ void PrintObject::compute_zone_boundary()
     if (!m_zone_interior || sla::get_mesh(*m_zone_interior).empty())
         return;
 
-    // Zone: Capture initial stage mesh for debug visualization
+    // Stage meshes are kept for debug visualization.
     m_zone_stages.initial = sla::get_mesh(*m_zone_interior);
 
-    // Filter out thin yolk sections before smoothing
-    // This removes small disconnected islands and thin protrusions
-    // Note: filtering works on grid only, mesh is regenerated by smooth_interior
+    // Drop thin yolk islands and protrusions. Works on the grid only; smooth_interior regenerates the mesh.
     if (min_inner_width > 0) {
         m_print->set_status(7, L("Filtering thin inner zone"));
         m_print->throw_if_canceled();
         zone_boundary::filter_thin_interior(*m_zone_interior, min_inner_width);
     }
 
-    // Report progress: smoothing
     m_print->set_status(8, L("Smoothing zone boundary"));
     m_print->throw_if_canceled();
 
-    // Apply constrained smoothing to remove surface undulations from propagating
-    // through the shell. Iterations scale with shell thickness: thicker shells need
-    // more smoothing since mean curvature flow smooths ~0.1mm per iteration.
-    // Formula: outer_width * 2.5 gives ~2mm of smoothing per 8mm of shell thickness.
+    // Constrained smoothing keeps surface undulations from propagating through the shell. Mean
+    // curvature flow moves ~0.1mm per iteration, so this smooths ~2mm per 8mm of shell thickness.
     int smoothing_iterations = std::clamp(int(outer_width * 2.5), 10, 30);
     zone_boundary::smooth_interior(*m_zone_interior, mesh, smoothing_iterations);
     m_print->throw_if_canceled();
@@ -1671,31 +1661,25 @@ void PrintObject::compute_zone_boundary()
     if (sla::get_mesh(*m_zone_interior).empty())
         return;
 
-    // Zone: Capture smoothed stage mesh for debug visualization
     m_zone_stages.smoothed = sla::get_mesh(*m_zone_interior);
 
-    // Report progress: slicing shell
     m_print->set_status(10, L("Slicing zone boundary"));
     m_print->throw_if_canceled();
 
-    // Get the interior mesh and slice it at same layer heights
+    // Slice at the object's own slice_z
     indexed_triangle_set interior_its = sla::get_mesh(*m_zone_interior);
 
-    // Collect slice heights
     std::vector<float> slice_zs;
     slice_zs.reserve(m_layers.size());
     for (const Layer *layer : m_layers)
         slice_zs.push_back(float(layer->slice_z));
 
-    // Slice the interior mesh
     MeshSlicingParamsEx params;
     params.mode = MeshSlicingParams::SlicingMode::Regular;
     std::vector<ExPolygons> interior_slices = slice_mesh_ex(interior_its, slice_zs, params);
     m_print->throw_if_canceled();
 
-    // Store boundaries in each layer
-    if (interior_slices.size() != m_layers.size())
-        return;
+    assert(interior_slices.size() == m_layers.size());
     for (size_t i = 0; i < m_layers.size(); ++i)
         m_layers[i]->zone_boundary = std::move(interior_slices[i]);
 }
